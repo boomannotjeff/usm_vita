@@ -1,0 +1,6 @@
+# Per-thread globals: <address> <size in bytes>, hex. A fixed-address access inside one is translated to
+# c->tls[k] + offset (recomp.py ea); rc_tls_init (generated recomp_tls.c) points every thread at the real address.
+# For pipelining the render list execution (76ea10) on its own thread. Empty = no change.
+971f0c 4 scratch   the per-frame scratch arena pointer: the worker allocates EXEC's sort arrays in its own arena
+95c724 10 in,stack  the scratch stack 4db590 (entity matrices) walks nodes on: size, alignment, base, top; the worker gets its own block
+970d60 4 -   that stack's "in use" flag

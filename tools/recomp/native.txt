@@ -1,0 +1,26 @@
+# Functions replaced by hand-written native code in src/vita/native.c (recomp.py emits their translation as fo_XXXX).
+411a50 C += v * p.y
+504270 C += v * p
+413530 C += v * p.x
+4126e0 direction through 3 matrix rows
+413e90 point through 4 matrix rows
+4139a0 direction through a matrix
+414360 point through a matrix
+48e900 affine matrix product rows
+76ea10 render list execution (pass-through: hazard tracer, pipelining)
+820890 binding display names (Vita button names for the pad)
+822160 _ftol2: st0 truncated to edx:eax
+81c580 text lookup: Vita wording for RESUME
+73ea70 the render frame (pass-through: pipeline fence)
+76e050 begin a render frame (pipeline fence)
+775170 world frame tail: reset textures (the pipeline worker runs it)
+4db590 entity world matrix (pipeline fence before logic rewrites one)
+55d780 the logic tick (pipeline measurement only)
+415a30 matrix product into this (pipeline copy-on-write of entity matrices)
+6c2e10 pedestrian density setter (Vita density cap, also the traffic density 6d8610 just stored)
+507130 transposed matrix product (48e900 + moves), render-list build
+7791a0 font from descriptor text (button icon glyphs)
+779570 text layout (unquoted button icons)
+55a680 streamed city chunk parse (pipeline fence)
+509d70 streamed entity spawn (pipeline fence)
+4a6110 character animation step (far characters every other tick)

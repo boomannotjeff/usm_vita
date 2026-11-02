@@ -1,0 +1,46 @@
+# Build output (every build dir: build, build-vita, build-vpc-prof, ...)
+build*/
+*-log.txt
+*.vpk
+*.velf
+*.self
+*.asi
+*.exe
+*.o
+*.obj
+
+# Generated from the game's own code: never publish (regenerate from your USM.exe, see README)
+src/recomp/gen/
+src/lifted/
+src/vita/imports_gen.c.bak
+
+# Personal / per-machine: logs, captures, crash dumps, device output
+outs/
+NEXT.md
+*.psp2dmp
+*.psp2dmp.tmp
+tools/recomp/standalone_loop.log
+tools/recomp/difftest_progress.txt
+frames/
+dump.txt
+
+# Python / editors
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.claude/
+
+# Build and tool logs
+*.log
+
+# Dev-only leftovers (kept on disk, not published): lifter-era notes and test loops for the hooked PC game
+docs/batch3-notes.md
+docs/overnight-notes.md
+tools/recomp/startup_test.ps1
+tools/recomp/continue_test.ps1
+tools/recomp/standalone_loop.ps1
+tools/recomp/bisect_rc.py
+
+
+docs/
