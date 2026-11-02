@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultimate Spider-Man for PS Vita</title>
+<meta name="description" content="A native PS Vita port of Ultimate Spider-Man (PC, 2005), made by statically recompiling the PC game. Bring your own game files.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bangers&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1024;
+    --panel: #161a38;
+    --panel-2: #1d2247;
+    --line: #2a3066;
+    --text: #e8eaf6;
+    --muted: #a3a8cc;
+    --red: #e3242b;
+    --red-dark: #a8141a;
+    --blue: #3d6bff;
+    --yellow: #ffd23f;
+    --code: #0a0c1c;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: var(--yellow); }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 0 16px; }
+
+  /* hero */
+  header.hero {
+    position: relative;
+    overflow: hidden;
+    background:
+      linear-gradient(180deg, rgba(13,16,36,.55) 0%, rgba(58,10,20,.72) 60%, rgba(13,16,36,.95) 100%),
+      url("img/banner.jpg") center 30% / cover no-repeat,
+      var(--red-dark);
+    border-bottom: 4px solid var(--red);
+    text-align: center;
+    padding: 72px 0 64px;
+  }
+  .hero h1 {
+    font-family: "Bangers", "Impact", sans-serif;
+    font-weight: 400;
+    letter-spacing: 2px;
+    font-size: clamp(42px, 8vw, 84px);
+    line-height: 1;
+    margin: 0 0 8px;
+    text-shadow: 4px 4px 0 #000;
+  }
+  .hero .tag {
+    display: inline-block;
+    font-family: "Bangers", "Impact", sans-serif;
+    letter-spacing: 1.5px;
+    font-size: clamp(20px, 3.5vw, 28px);
+    background: var(--yellow);
+    color: #111;
+    padding: 2px 14px;
+    transform: rotate(-2deg);
+    box-shadow: 4px 4px 0 #000;
+    margin-bottom: 22px;
+  }
+  .hero p.lead { max-width: 640px; margin: 0 auto 28px; font-size: 18px; color: #f3f3fb; }
+  .btns { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block;
+    font-weight: 700;
+    text-decoration: none;
+    padding: 14px 26px;
+    border-radius: 10px;
+    border: 3px solid #000;
+    box-shadow: 4px 4px 0 #000;
+    transition: transform .08s ease, box-shadow .08s ease;
+  }
+  .btn:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 #000; }
+  .btn.primary { background: var(--yellow); color: #111; }
+  .btn.secondary { background: var(--panel-2); color: var(--text); }
+
+  /* sections */
+  section { padding: 48px 0 8px; }
+  h2 {
+    font-family: "Bangers", "Impact", sans-serif;
+    font-weight: 400;
+    letter-spacing: 1.5px;
+    font-size: 36px;
+    margin: 0 0 16px;
+    color: #fff;
+  }
+  h2 span { color: var(--red); }
+  h3 { margin: 24px 0 8px; font-size: 18px; }
+  p { margin: 0 0 14px; }
+  .muted { color: var(--muted); }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 20px 22px;
+  }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .feature h3 { margin: 0 0 6px; color: var(--yellow); font-size: 16px; }
+  .feature p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  .shots { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .shots figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .shots img { display: block; width: 100%; height: auto; aspect-ratio: 960 / 544; object-fit: cover; }
+  .shots figcaption { padding: 8px 12px; font-size: 14px; color: var(--muted); }
+
+  ol.steps { counter-reset: step; list-style: none; padding: 0; margin: 0; }
+  ol.steps > li {
+    counter-increment: step;
+    position: relative;
+    padding: 18px 20px 18px 72px;
+    margin-bottom: 12px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+  }
+  ol.steps > li::before {
+    content: counter(step);
+    position: absolute; left: 18px; top: 16px;
+    width: 38px; height: 38px;
+    display: grid; place-items: center;
+    font-family: "Bangers", "Impact", sans-serif; font-size: 24px;
+    background: var(--red); color: #fff;
+    border: 3px solid #000; border-radius: 50%;
+  }
+  ol.steps strong { display: block; margin-bottom: 4px; }
+
+  code, pre {
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-size: 14px;
+  }
+  code { background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+  pre {
+    background: var(--code); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; margin: 10px 0 0; line-height: 1.5;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; }
+  .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  .key {
+    display: inline-block; min-width: 28px; text-align: center;
+    background: var(--panel-2); border: 1px solid var(--line); border-bottom-width: 3px;
+    border-radius: 6px; padding: 0 8px; font-weight: 600; font-size: 14px; white-space: nowrap;
+  }
+
+  .note {
+    border-left: 4px solid var(--yellow);
+    background: rgba(255, 210, 63, .07);
+    padding: 14px 18px; border-radius: 0 10px 10px 0; margin: 16px 0 0;
+  }
+  .note.red { border-left-color: var(--red); background: rgba(227, 36, 43, .08); }
+
+  footer {
+    margin-top: 56px; padding: 28px 0 40px;
+    border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 14px;
+  }
+  footer p { margin: 0 0 8px; }
+
+  @media (max-width: 560px) {
+    header.hero { padding: 56px 0 48px; }
+    ol.steps > li { padding-left: 62px; }
+    ol.steps > li::before { left: 12px; }
+    th, td { padding: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="tag">PS Vita port</div>
+    <h1>Ultimate <span style="white-space:nowrap">Spider-Man</span></h1>
+    <p class="lead">The 2005 PC game running natively on the PS Vita: swing through the whole city, the story, the
+      comic-book cutscenes and the Venom missions. Bring your own copy of the PC game.</p>
+    <div class="btns">
+      <a class="btn primary" href="https://github.com/boomannotjeff/usm_vita/releases/latest">Download the VPK</a>
+      <a class="btn secondary" href="#install">How to install</a>
+      <a class="btn secondary" href="https://github.com/boomannotjeff/usm_vita">Source code</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section id="about">
+    <h2>What <span>is this?</span></h2>
+    <p>This is a port of the PC version of <em>Ultimate Spider-Man</em> to the PS Vita. It isn't an emulator: the
+      PC game's program was translated, instruction by instruction, into C code that is compiled for the Vita's ARM
+      processor (static recompilation, the same idea as N64Recomp or XenonRecomp). Windows, Direct3D&nbsp;9,
+      DirectSound and the controls are re-created underneath it, and the graphics are drawn with vitaGL.</p>
+    <p>The VPK contains <strong>no game data</strong>: the city, characters, sound and movies are read from your own
+      PC game files.</p>
+
+    <div class="grid" style="margin-top:20px">
+      <div class="card feature">
+        <h3>The whole game</h3>
+        <p>Story missions, free roam, city goals, Venom, the comic-panel cutscenes and the movies, played from the
+          game's own files.</p>
+      </div>
+      <div class="card feature">
+        <h3>Made for the Vita</h3>
+        <p>16:9 screen, Vita button icons in every prompt, sound and music, and saves on the memory card.</p>
+      </div>
+      <div class="card feature">
+        <h3>Tuned for speed</h3>
+        <p>Uses a second CPU core for drawing, fog that hides the far city, and settings that trade detail for
+          frame rate.</p>
+      </div>
+      <div class="card feature">
+        <h3>Settings menu</h3>
+        <p>A <em>Settings</em> button on the LiveArea lets you change traffic, view distance, resolution and more,
+          without editing files.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="screenshots">
+    <h2><span>Screenshots</span></h2>
+    <div class="shots">
+      <figure><img src="img/city-street.jpg" alt="Spider-Man swinging down a Manhattan street" loading="lazy" width="960" height="544"><figcaption>Swinging through Manhattan</figcaption></figure>
+      <figure><img src="img/city-rooftops.jpg" alt="Spider-Man on the rooftops with the city around him" loading="lazy" width="960" height="544"><figcaption>Free roam on the rooftops</figcaption></figure>
+      <figure><img src="img/wall-run.jpg" alt="Spider-Man running up a building" loading="lazy" width="960" height="544"><figcaption>Wall crawling</figcaption></figure>
+      <figure><img src="img/comic-cutscene.jpg" alt="A comic-panel cutscene" loading="lazy" width="960" height="544"><figcaption>Comic-panel cutscenes</figcaption></figure>
+      <figure><img src="img/tutorial-venom.jpg" alt="A tutorial box showing a Vita button icon" loading="lazy" width="960" height="544"><figcaption>Prompts with the Vita's buttons</figcaption></figure>
+      <figure><img src="img/main-menu.jpg" alt="The game's main menu" loading="lazy" width="960" height="544"><figcaption>The original menus</figcaption></figure>
+    </div>
+    <p class="muted" style="margin-top:10px">Captured from the port's own renderer (the Vita code running in a PC test
+      build), at the Vita's 960&times;544.</p>
+  </section>
+
+  <section id="need">
+    <h2>What you <span>need</span></h2>
+    <div class="card">
+      <ul style="margin:0; padding-left:20px">
+        <li>A PS Vita or PS TV that can run homebrew (HENkaku / Ens&#333;), with <strong>VitaShell</strong>.</li>
+        <li><strong>libshacccg.suprx</strong> in <code>ur0:data/</code>: the shader compiler every vitaGL game
+          needs. If you've played another vitaGL port you already have it; otherwise follow the
+          <a href="https://samilops2.gitbook.io/vita-troubleshooting-guide/shader-compiler/extract-libshacccg.suprx">extraction guide</a>.</li>
+        <li>Your own copy of <strong>Ultimate Spider-Man for PC</strong> (the 2005 Activision release): its
+          <code>USM.exe</code> and its <code>Data</code> folder.</li>
+        <li>About <strong>1.5&nbsp;GB</strong> free on <code>ux0:</code> for the game files.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>How to <span>install</span></h2>
+    <ol class="steps">
+      <li>
+        <strong>Download the VPK</strong>
+        Get <code>usm.vpk</code> from the
+        <a href="https://github.com/boomannotjeff/usm_vita/releases/latest">latest release</a>.
+      </li>
+      <li>
+        <strong>Install it</strong>
+        Copy <code>usm.vpk</code> to your Vita (FTP or USB in VitaShell), then open it in VitaShell and install it.
+      </li>
+      <li>
+        <strong>Copy your game files</strong>
+        From the folder where the PC game is installed, copy <code>USM.exe</code> and the whole <code>Data</code>
+        folder into <code>ux0:data/usm/</code>. It should look like this:
+<pre>ux0:data/usm/
+├── USM.exe
+└── Data/
+    ├── movies/
+    ├── packs/
+    ├── Sound/
+    └── ...</pre>
+        <p class="muted" style="margin:10px 0 0">Copy the files exactly as they are: no conversion, the movies too.</p>
+      </li>
+      <li>
+        <strong>Play</strong>
+        Start <em>Ultimate Spider-Man</em> from the LiveArea. If <code>USM.exe</code> or the shader compiler is
+        missing, the game tells you on screen.
+      </li>
+    </ol>
+    <div class="note">The first start of each area takes a little longer: shaders are compiled once and then kept in
+      <code>ux0:data/usm/shadercache/</code>.</div>
+  </section>
+
+  <section id="controls">
+    <h2><span>Controls</span></h2>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Button</th><th>Action</th></tr>
+        <tr><td><span class="key">Left stick</span></td><td>Move</td></tr>
+        <tr><td><span class="key">Right stick</span></td><td>Camera</td></tr>
+        <tr><td><span class="key">&#x2715;</span></td><td>Jump</td></tr>
+        <tr><td><span class="key">&#x25A1;</span></td><td>Punch</td></tr>
+        <tr><td><span class="key">&#x25B3;</span></td><td>Kick</td></tr>
+        <tr><td><span class="key">&#x25CB;</span></td><td>Wall crawl</td></tr>
+        <tr><td><span class="key">R</span></td><td>Web swing</td></tr>
+        <tr><td><span class="key">L</span></td><td>Web zip</td></tr>
+        <tr><td><span class="key">Rear touchpad</span></td><td>Camera lock (R3 on PC)</td></tr>
+        <tr><td><span class="key">L</span> / <span class="key">R</span></td><td>Quick-time events (left / right click on PC)</td></tr>
+        <tr><td><span class="key">Start</span></td><td>Pause</td></tr>
+        <tr><td><span class="key">Select</span></td><td>City map</td></tr>
+        <tr><td><span class="key">D-pad</span></td><td>Menus</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section id="settings">
+    <h2><span>Settings</span></h2>
+    <p>Press <strong>Settings</strong> under the start button on the game's LiveArea page. Pick a line with the D-pad
+      up/down and change it with left/right. <span class="key">&#x2715;</span> saves and quits,
+      <span class="key">&#x25CB;</span> quits without saving, <span class="key">&#x25B3;</span> restores the defaults.
+      Start the game normally afterwards.</p>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Setting</th><th>What it does</th></tr>
+        <tr><td>People and traffic</td><td>How many pedestrians and cars. The biggest speed setting; the default is very low.</td></tr>
+        <tr><td>View distance</td><td>How far you can see before the city fades into fog.</td></tr>
+        <tr><td>Resolution</td><td>Size of the 3D picture, scaled to the screen (default 720&times;408).</td></tr>
+        <tr><td>Texture size</td><td>Largest texture kept: sharper, or lighter on memory.</td></tr>
+        <tr><td>Far characters</td><td>Characters far from Spider-Man animate every other frame, which helps in crowded fights.</td></tr>
+        <tr><td>Far objects</td><td>How far the game still prepares objects it won't show.</td></tr>
+        <tr><td>Frame rate cap</td><td>A steady 20/25/30 fps can feel smoother than a varying one.</td></tr>
+        <tr><td>Debug options</td><td>Log file, culling and second-core switches, frame dumps: for reporting bugs.</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section id="performance">
+    <h2>Performance &amp; <span>known issues</span></h2>
+    <div class="card">
+      <p>The Vita has much less CPU power than the PCs this game was made for, so expect roughly
+        <strong>18&ndash;30&nbsp;fps</strong>. Swinging through the city usually runs at about 20&ndash;25, smaller
+        interiors reach 30, and big fights with many enemies can drop lower.</p>
+      <ul style="margin:0; padding-left:20px">
+        <li>Short hitches can happen while new parts of the city stream in, mostly just after a mission ends.</li>
+        <li>People and traffic are kept low by default. Raising them in Settings costs a lot of speed.</li>
+        <li>The far city is hidden in fog to keep the frame rate up. Set the view distance to <em>Everything</em> if
+          you prefer the full skyline.</li>
+      </ul>
+      <p class="muted" style="margin:14px 0 0">Found a bug? Turn on <em>DEBUG: write log.txt</em> in Settings, play
+        until it happens, then attach <code>ux0:data/usm/log.txt</code> to an
+        <a href="https://github.com/boomannotjeff/usm_vita/issues">issue</a>.</p>
+    </div>
+  </section>
+
+  <section id="how">
+    <h2>How it <span>works</span></h2>
+    <p>The translator reads every function of the PC game's program and writes equivalent C code, which is then
+      compiled for the Vita. A runtime underneath stands in for the PC: the Windows calls, Direct3D&nbsp;9 (turned
+      into vitaGL calls, with the game's shaders translated to the Vita's), DirectSound, DirectInput, and the Bink
+      movie player (FFmpeg's Bink decoder). Some of the busiest code was rewritten by hand, and the drawing runs on
+      a second CPU core while the game works out the next frame.</p>
+    <p>Building it yourself: see the
+      <a href="https://github.com/boomannotjeff/usm_vita#readme">README</a>. The translation is generated from your
+      own <code>USM.exe</code>.</p>
+  </section>
+
+  <footer>
+    <p><strong>Credits:</strong> <a href="https://github.com/Rinnegatamante/vitaGL">vitaGL</a> by Rinnegatamante,
+      <a href="https://vitasdk.org">VitaSDK</a>, <a href="https://ffmpeg.org">FFmpeg</a> (Bink decoder, LGPL&nbsp;2.1),
+      <a href="https://www.capstone-engine.org">Capstone</a>, and the Aileron font (public domain) in the Settings menu.</p>
+    <p>This is an unofficial fan project, not affiliated with or endorsed by Activision, Marvel, Treyarch or Sony.
+      <em>Ultimate Spider-Man</em> and its characters are trademarks of Marvel; the game is &copy; Activision. No game
+      data is distributed: you need your own legally obtained copy of the PC game.</p>
+  </footer>
+</main>
+
+</body>
+</html>
