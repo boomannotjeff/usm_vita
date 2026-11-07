@@ -1,16 +1,19 @@
 /* Native versions of the game's hottest math helpers (row-vector 4x4 matrices, translated chains of tiny calls that
    cost ~15-20% of a Vita frame). tools/recomp/native.txt lists them; recomp.py then emits their translation as
    fo_XXXX and these f_XXXX take their place for every caller.
-   They copy the original x87 code exactly: precision control is 53-bit, so a product kept on the x87 stack is a
-   double, one stored to a float temp first is rounded (F()). They also leave eax/ecx/edx as the original does
-   (MSVC LTCG callers may rely on what a callee leaves in them).
+   They do what the original x87 code does, in float: the game ran the x87 at 24 bits, doubles here only cost time.
+   They leave eax/ecx/edx as the original does (MSVC LTCG callers may rely on what a callee leaves in them).
    Check mode (env USM_NATIVE_CHECK=1, vpc): every call also runs the original on a copy and compares the outputs and
    registers; logs "native check" lines. */
 #include <math.h>
 #include <stdlib.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #include "recomp.h"
 #include "vita.h"
+#include "d3d9.h"
 
 static inline float F(double x) { return (float)x; }
 static inline uint32_t B(float x) { uint32_t u; memcpy(&u, &x, 4); return u; }
@@ -29,8 +32,25 @@ typedef struct { uint32_t key; volatile uint32_t gen; uint32_t m[16]; } Fork;
 static Fork g_fork[FORK_N];
 static volatile uint32_t g_fgen;  /* 0: no frame being drawn */
 static uint32_t g_fsaved, g_fhits;  /* matrices saved by main / reads the worker got from a saved copy (the log) */
+/* One bit per hashed matrix row that has a saved or worker-computed copy this generation, one table per writer (main,
+   worker), both emptied at the hand-off: the worker's vector helpers read thousands of rows that have none, and two
+   hash probes per row of each were ~25% of its time (scan1) */
+static uint32_t g_rows_m[1024], g_rows_w[1024];
+static inline uint32_t row_hash(uint32_t p) { return (p * 2654435761u) >> 17; }
+static inline void rows_mark(uint32_t* t, uint32_t a) {
+    for (uint32_t k = 0; k < 64; k += 16) {
+        uint32_t h = row_hash(a + k);
+        t[h >> 5] |= 1u << (h & 31);
+    }
+}
+static inline int row_kept(uint32_t p) {
+    uint32_t h = row_hash(p), b = 1u << (h & 31);
+    return ((g_rows_m[h >> 5] | g_rows_w[h >> 5]) & b) != 0;
+}
 static void fork_save(uint32_t a) {
     uint32_t g = g_fgen;
+    rows_mark(g_rows_m, a);  /* before the copy is published and the matrix rewritten: see read_mat */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     for (uint32_t i = (a * 2654435761u) >> 20, n = 0; n < 64; i = (i + 1) & (FORK_N - 1), n++) {
         Fork* f = &g_fork[i];
         uint32_t fg = __atomic_load_n(&f->gen, __ATOMIC_ACQUIRE);
@@ -51,7 +71,7 @@ static const uint32_t* fork_find(uint32_t a) {
     }
     return NULL;
 }
-static Ctx* g_wc;  /* the render pipeline's worker context (below) */
+Ctx* g_wc;  /* the render pipeline's worker context (below) */
 /* The worker's own world matrices: 4db590 on the worker (w_4db590) computes into these guest slots, keyed by the
    entity's world-matrix address, instead of into the entity, so the worker never writes what main's next tick writes.
    Worker-only; a generation per hand-off empties it. */
@@ -64,6 +84,7 @@ static uint32_t wov_find(uint32_t a, int add) {
         if (g_wov_gen[i] != g_fgen) {
             if (!add) return 0;
             g_wov_gen[i] = g_fgen, g_wov_key[i] = a;
+            rows_mark(g_rows_w, a);
             return g_wov_mem + 64 * i;
         }
     }
@@ -72,7 +93,16 @@ static uint32_t wov_find(uint32_t a, int add) {
 /* a 64-byte matrix as frame N saw it: the worker's own copy, else the saved copy if main has rewritten it since the
    hand-off. Read live, then look again: main publishes the copy before it writes, so a read that raced a write finds
    the copy the second time */
-static void read_mat(Ctx* c, uint32_t mp, float* m, int n) {
+__attribute__((hot)) static void read_mat(Ctx* c, uint32_t mp, float* m, int n) {
+    if (c != g_wc || !g_fgen) {
+        for (int i = 0; i < n; i++) m[i] = LDF32(mp + 4 * i);
+        return;
+    }
+    if (!row_kept(mp)) {
+        for (int i = 0; i < n; i++) m[i] = LDF32(mp + 4 * i);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (!row_kept(mp)) return;
+    }
     uint32_t o = c == g_wc && g_fgen && g_wov_mem ? wov_find(mp, 0) : 0;
     if (o) {
         for (int i = 0; i < n; i++) m[i] = LDF32(o + 4 * i);
@@ -87,8 +117,8 @@ static void read_mat(Ctx* c, uint32_t mp, float* m, int n) {
 }
 /* n floats at p as frame N saw them, p anywhere in a saved or worker-computed matrix (rows of it: the vector
    helpers take row pointers). Worker only; elsewhere a plain load */
-static void ldw(Ctx* c, float* d, uint32_t p, int n) {
-    if (c == g_wc && g_fgen)
+__attribute__((hot)) static void ldw(Ctx* c, float* d, uint32_t p, int n) {
+    if (c == g_wc && g_fgen && row_kept(p))
         for (uint32_t k = 0; k + 4 * n <= 64; k += 16) {
             uint32_t o = g_wov_mem ? wov_find(p - k, 0) : 0;
             if (o) {
@@ -105,47 +135,66 @@ static void ldw(Ctx* c, float* d, uint32_t p, int n) {
 }
 static float ldf(Ctx* c, uint32_t p) { float f; ldw(c, &f, p, 1); return f; }
 
-/* 411a50: C += v * s, s a scalar (504270 uses v[i] * p[i]): products 0 and 1 stay on the stack, 2 and 3 are stored */
-static void madd_late(float* C, const float* v, const float* s) {
-    double t0 = (double)v[0] * s[0], t1 = (double)v[1] * s[1];
-    float t2 = F((double)v[2] * s[2]), t3 = F((double)v[3] * s[3]);
-    C[0] = F(t0 + C[0]), C[1] = F(t1 + C[1]), C[2] = F((double)t2 + C[2]), C[3] = F((double)t3 + C[3]);
+/* The vector core, in float: the game never set its FPU to 53 bits, so the x87 ran these at 24 and doubles here only cost
+   time (a VFP double multiply is the slowest thing on the Cortex-A9). NEON does the 4 lanes in one go on the Vita. */
+static inline void madd_late(float* C, const float* v, const float* s) {  /* C += v * s, by lane */
+#ifdef __ARM_NEON
+    vst1q_f32(C, vmlaq_f32(vld1q_f32(C), vld1q_f32(v), vld1q_f32(s)));
+#else
+    for (int i = 0; i < 4; i++) C[i] += v[i] * s[i];
+#endif
 }
-/* 413530: C += v * x: only product 0 stays on the stack */
-static void madd_x(float* C, const float* v, float x) {
-    double t0 = (double)x * v[0];
-    float t1 = F((double)x * v[1]), t2 = F((double)x * v[2]), t3 = F((double)x * v[3]);
-    C[0] = F(t0 + C[0]), C[1] = F((double)t1 + C[1]), C[2] = F((double)t2 + C[2]), C[3] = F((double)t3 + C[3]);
+static inline void madd_x(float* C, const float* v, float x) {  /* C += v * x */
+#ifdef __ARM_NEON
+    vst1q_f32(C, vmlaq_n_f32(vld1q_f32(C), vld1q_f32(v), x));
+#else
+    for (int i = 0; i < 4; i++) C[i] += v[i] * x;
+#endif
 }
-/* the shared tail of 4126e0/413e90: out = L + r * z */
-static void tail(float* out, const float* L, const float* r, float z) {
-    double a = (double)r[0] * z, b = (double)r[1] * z;
-    float c2 = F((double)r[2] * z), c3 = F((double)r[3] * z);
-    out[0] = F(a + L[0]), out[1] = F((double)L[1] + b), out[2] = F((double)L[2] + c2), out[3] = F((double)L[3] + c3);
+static inline void tail(float* out, const float* L, const float* r, float z) {  /* out = L + r * z */
+#ifdef __ARM_NEON
+    vst1q_f32(out, vmlaq_n_f32(vld1q_f32(L), vld1q_f32(r), z));
+#else
+    for (int i = 0; i < 4; i++) out[i] = L[i] + r[i] * z;
+#endif
 }
-static void splat(float* d, float s) { d[0] = d[1] = d[2] = d[3] = s; }
+static inline void mul_x(float* L, const float* r, float x) {  /* L = r * x */
+#ifdef __ARM_NEON
+    vst1q_f32(L, vmulq_n_f32(vld1q_f32(r), x));
+#else
+    for (int i = 0; i < 4; i++) L[i] = r[i] * x;
+#endif
+}
 
 /* 4126e0 core: out = v.x * r0 + v.y * r1 + v.z * r2 (a direction through the 3x4 rows) */
-static void dir3(float* out, const float* r0, const float* r1, const float* r2, const float* v) {
-    float L[4], s[4];
-    for (int i = 0; i < 4; i++) L[i] = F((double)v[0] * r0[i]);
-    splat(s, v[1]), madd_late(L, r1, s);
+static inline void dir3(float* out, const float* r0, const float* r1, const float* r2, const float* v) {
+    float L[4];
+    mul_x(L, r0, v[0]);
+    madd_x(L, r1, v[1]);
     tail(out, L, r2, v[2]);
 }
 /* 413e90 core: out = r3 + v.x * r0 + v.y * r1 + v.z * r2 (a point) */
-static void pt3(float* out, const float* r0, const float* r1, const float* r2, const float* r3, const float* v) {
-    float L[4], s[4];
+static inline void pt3(float* out, const float* r0, const float* r1, const float* r2, const float* r3, const float* v) {
+    float L[4];
     memcpy(L, r3, 16);
     madd_x(L, r0, v[0]);
-    splat(s, v[1]), madd_late(L, r1, s);
+    madd_x(L, r1, v[1]);
     tail(out, L, r2, v[2]);
 }
 
 static void n_411a50(Ctx* c) {  /* thiscall (C, v, p): C += v * p.y; ret 8 */
-    float C[4], v[4], p[4], s[4];
+    float C[4], v[4], p[4];
     uint32_t cp = c->ecx;
     ldv(C, cp), ldw(c, v, arg(c, 1), 4), ldw(c, p, arg(c, 2), 4);
-    splat(s, p[1]), madd_late(C, v, s), stv(cp, C);
+    madd_x(C, v, p[1]), stv(cp, C);
+    c->eax = B(C[2]), c->edx = B(C[3]);
+    ret(c, 8);
+}
+static void n_411ac0(Ctx* c) {  /* thiscall (C, v, p): C += v * p.z; ret 8 */
+    float C[4], v[4], p[4];
+    uint32_t cp = c->ecx;
+    ldv(C, cp), ldw(c, v, arg(c, 1), 4), ldw(c, p, arg(c, 2), 4);
+    madd_x(C, v, p[2]), stv(cp, C);
     c->eax = B(C[2]), c->edx = B(C[3]);
     ret(c, 8);
 }
@@ -166,22 +215,22 @@ static void n_413530(Ctx* c) {  /* thiscall (C, v, p): C += v * p.x; ret 8 */
     ret(c, 8);
 }
 static void n_4126e0(Ctx* c) {  /* cdecl (out, r0, v, r1, v, r2, v): v read through args 3, 5 and 7 */
-    float r0[4], r1[4], r2[4], L[4], s[4], o[4];
+    float r0[4], r1[4], r2[4], L[4], o[4];
     uint32_t out = arg(c, 1);
     ldw(c, r0, arg(c, 2), 4), ldw(c, r1, arg(c, 4), 4), ldw(c, r2, arg(c, 6), 4);
     float x = ldf(c, arg(c, 3)), y = ldf(c, arg(c, 5) + 4), z = ldf(c, arg(c, 7) + 8);
-    for (int i = 0; i < 4; i++) L[i] = F((double)x * r0[i]);
-    splat(s, y), madd_late(L, r1, s);
+    mul_x(L, r0, x);
+    madd_x(L, r1, y);
     tail(o, L, r2, z), stv(out, o);
     c->eax = out, c->ecx = arg(c, 6), c->edx = B(L[3]);
     ret(c, 0);
 }
 static void n_413e90(Ctx* c) {  /* cdecl (out, r0, v, r1, v, r2, v, r3) */
-    float r0[4], r1[4], r2[4], L[4], s[4], o[4];
+    float r0[4], r1[4], r2[4], L[4], o[4];
     uint32_t out = arg(c, 1);
     ldw(c, L, arg(c, 8), 4), ldw(c, r0, arg(c, 2), 4), ldw(c, r1, arg(c, 4), 4), ldw(c, r2, arg(c, 6), 4);
     madd_x(L, r0, ldf(c, arg(c, 3)));
-    splat(s, ldf(c, arg(c, 5) + 4)), madd_late(L, r1, s);
+    madd_x(L, r1, ldf(c, arg(c, 5) + 4));
     tail(o, L, r2, ldf(c, arg(c, 7) + 8)), stv(out, o);
     c->eax = out, c->ecx = arg(c, 6), c->edx = B(L[3]);
     ret(c, 0);
@@ -279,7 +328,7 @@ static void check(Ctx* c, void (*nat)(Ctx*), void (*orig)(Ctx*), Stat* st, const
     if ((st->calls & 0xfffff) == 0) vlog("native check %s: %u calls, %u mismatches\n", st->name, st->calls, st->bad);
 }
 #define NATIVE_(addr, ecx_free, n, ...)                                                           \
-    void f_##addr(Ctx* c) {                                                              \
+    __attribute__((hot)) void f_##addr(Ctx* c) {                                         \
         if (USM_CHECKS && __builtin_expect(g_check, 0)) {                                        \
             if (g_check < 0) g_check = getenv("USM_NATIVE_CHECK") != NULL;               \
             if (g_check) {                                                               \
@@ -294,6 +343,7 @@ static void check(Ctx* c, void (*nat)(Ctx*), void (*orig)(Ctx*), Stat* st, const
 #define NATIVE(addr, n, ...) NATIVE_(addr, 0, n, __VA_ARGS__)
 #define A(i) arg(c, i)
 NATIVE(411a50, 1, c->ecx)
+NATIVE(411ac0, 1, c->ecx)
 NATIVE(504270, 1, c->ecx)
 NATIVE(413530, 1, c->ecx)
 NATIVE(4126e0, 1, A(1))
@@ -304,6 +354,80 @@ NATIVE(48e900, 4, A(1), A(2), A(3), A(4))
 NATIVE(507130, 4, A(1), A(1) + 16, A(1) + 32, A(1) + 48)
 NATIVE_(822160, 1, 0, 0)
 
+/* ---- Particle helpers: the per-sprite calls of the 8 particle renderers 75c1e0..7627c0 (see f_75af90), and the vector sine, which
+   also went through the ceil import 4 times a call: 2,860 calls a frame in a burning street, the game's most called import ---- */
+static inline int64_t tl(float v) {  /* _ftol */
+    return v != v || v >= 9223372036854775808.0f || v <= -9223372036854775808.0f ? INT64_MIN : (int64_t)v;
+}
+static void n_75b9e0(Ctx* c) {  /* thiscall (position, u, v): a packed vertex: 3 truncated shorts, then v << 4 | u & 15; ret 12 */
+    uint32_t o = c->ecx, p = arg(c, 1), u = arg(c, 2) & 255, v = arg(c, 3);
+    int64_t x = tl(LDF32(p)), y = tl(LDF32(p + 4)), z = tl(LDF32(p + 8));
+    ST16(o, (uint16_t)x), ST16(o + 2, (uint16_t)y), ST16(o + 4, (uint16_t)z);
+    c->eax = v << 4 | (u & 15);
+    ST16(o + 6, (uint16_t)c->eax);
+    c->ecx = u & 15, c->edx = (uint32_t)((uint64_t)z >> 32);
+    ret(c, 12);
+}
+static void n_75b950(Ctx* c) {  /* thiscall (colour): 4 floats to bytes, x255 and truncated, r and b swapped; ret 4 */
+    uint32_t o = c->ecx, p = arg(c, 1);
+    float k = LDF32(0x871978);
+    int64_t a = tl(LDF32(p + 8) * k), b = tl(LDF32(p + 4) * k), d = tl(LDF32(p) * k), e = tl(LDF32(p + 12) * k);
+    ST8(o, (uint8_t)a), ST8(o + 1, (uint8_t)b), ST8(o + 2, (uint8_t)d), ST8(o + 3, (uint8_t)e);
+    c->eax = o, c->edx = (uint32_t)((uint64_t)e >> 32);
+    ret(c, 4);
+}
+static void n_75bf10(Ctx* c) {  /* cdecl (out, range): a random vector in +-range; the w term reads a word left on the stack, as the original */
+    if ((LD32(0x971638) & 3) != 3) {  /* the first call sets its constants up */
+        fo_75bf10(c);
+        return;
+    }
+    uint32_t out = arg(c, 1), p = arg(c, 2), r = LD32(0x93ad40), v[3];
+    for (int i = 0; i < 3; i++) r = r * 0x41c64e6du + 0x3039, v[i] = r >> 16;
+    ST32(0x93ad40, r);
+    float k = LDF32(0x8b5544), x = (float)(int32_t)v[0] * k, y = (float)(int32_t)v[1] * k, z = (float)(int32_t)v[2] * k;
+    float s0 = LDF32(0x971618) * x - LDF32(0x971628), s1 = LDF32(0x97161c) * y - LDF32(0x97162c);
+    float s2 = LDF32(0x971620) * z - LDF32(0x971630), s3 = LDF32(c->esp - 4) * LDF32(0x971624) - LDF32(0x971634);
+    float w = s3 * LDF32(p + 12), t = s2 * LDF32(p + 8), u = s1 * LDF32(p + 4), q = s0 * LDF32(p);
+    STF32(out, q), STF32(out + 4, u), STF32(out + 8, t), STF32(out + 12, w);
+    c->eax = out, c->ecx = r, c->edx = 0;
+    ret(c, 0);
+}
+static void n_75b870(Ctx* c) {  /* cdecl (out, table, t): interpolate a 16-row table of vectors, t clamped to 0..0.99 */
+    uint32_t out = arg(c, 1), tb = arg(c, 2);
+    float t = LDF32(c->esp + 12), hi = LDF32(0x87eb44), lo = LDF32(0x871780), x;
+    if (hi < t) x = hi;
+    else x = lo > t ? lo : t;
+    x *= LDF32(0x8a5a68);
+    int64_t i = tl(x);
+    uint32_t a = tb + (uint32_t)i * 16;
+    float f = x - (float)(int32_t)i;
+    STF32(c->esp + 12, f);  /* the original keeps it in its argument slot */
+    float r[4];
+    for (int k = 0; k < 4; k++) r[k] = (LDF32(a + 16 + 4 * k) - LDF32(a + 4 * k)) * f + LDF32(a + 4 * k);
+    for (int k = 0; k < 4; k++) STF32(out + 4 * k, r[k]);
+    c->eax = out, c->ecx = tb, c->edx = (uint32_t)((uint64_t)i >> 32);
+    ret(c, 0);
+}
+static void n_5044f0(Ctx* c) {  /* cdecl (out, angle, 1 / 2pi): sine of each component, a polynomial on the phase */
+    uint32_t out = arg(c, 1), in = arg(c, 2), p = arg(c, 3);
+    float half = LDF32(0x870d44), quarter = LDF32(0x87e6f0), k1 = LDF32(0x883528), k9 = LDF32(0x88352c), r[4];
+    for (int i = 0; i < 4; i++) {
+        float a = -fabsf(LDF32(in + 4 * i)), m = a * LDF32(p + 4 * i), f = ceilf(m) - m;
+        float y = fabsf(f - half) - quarter, y2 = y * y, y3 = y2 * y, y4 = y2 * y2, y5 = y4 * y, y7 = y3 * y4, y9 = y5 * y4;
+        float q = y9 * k9;
+        q += y7 * LDF32(0x882578 + 4 * i), q += y5 * LDF32(0x882568 + 4 * i), q += y3 * LDF32(0x882558 + 4 * i);
+        r[i] = y * k1 + q;
+    }
+    for (int i = 0; i < 4; i++) STF32(out + 4 * i, r[i]);
+    c->eax = out;
+    ret(c, 0);
+}
+NATIVE_(75b9e0, 0, 1, c->ecx)
+NATIVE_(75b950, 0, 1, c->ecx)
+NATIVE_(75bf10, 1, 2, A(1), 0x93ad40)
+NATIVE_(75b870, 0, 2, A(1), c->esp + 12)
+NATIVE_(5044f0, 1, 1, A(1))
+
 /* ---- Render pipeline ----
    The world frame (73ea70) is: 76e050 begin, 73e710 build the render lists, 76ea10 EXEC (sort them, every draw call,
    Present: ~28% of the Vita's game thread), then a tail (unbind stream 0, 775170 reset textures). With the pipeline on,
@@ -312,8 +436,25 @@ NATIVE_(822160, 1, 0, 0)
    call (shims.c). The hazard tracer (wtrace.c, vpc -DRC_WTRACE) found what the two sides share in that window: no
    globals in free roam; per-thread globals go in tools/recomp/tls.txt. Known: entity matrices (4db590) can be one
    logic tick newer than the rest of a frame for objects that moved (a jitter, not a crash).
+   Mode 3 also overlaps the next render frame's prologue and list build: a frame then takes max(main, worker, render)
+   instead of max(logic, worker) + build. The game already keeps two of what the two sides fill (the dynamic VB/IB pair,
+   the second allocator, flipped by EXEC), the scratch arena gets a second block (arena_flip), and the small globals both
+   touch are per-thread (tls.txt, "in"): the worker works on frame N's copies, and pipe_after_handoff does on the real
+   ones what EXEC would have done to them by the time main gets there.
    Mode (ux0:data/usm/pipe.txt, or env USM_PIPE; a digit): 0 off, 1 the worker does it but main waits at once (no
-   overlap: checks the plumbing), 2 overlapped (default). Checked on vpc: free roam, New Game, the first fight. */
+   overlap: checks the plumbing), 2 overlaps the logic tick only, 3 overlaps the build too (default). */
+/* EXEC's effects on the globals main keeps using (76ea10, 76e980): flip the dynamic VB/IB pair and restart its cursors,
+   back to the root view, flip the second allocator, count the Present and the draw stamp, clear the statistics */
+void pipe_after_handoff(void) {
+    ST32(0x972a5c, LD32(0x972a5c) ^ 1);
+    ST32(0x972a3c, 0), ST32(0x972a40, 0), ST32(0x972a44, 0), ST32(0x972a48, 0);
+    ST32(0x971f00, LD32(0x971f04));
+    uint32_t a = LD32(0x975308);
+    if (LD32(0x975314) == a) a = LD32(0x97530c);
+    ST32(0x975314, a), ST32(0x975310, a);
+    ST32(0x972908, LD32(0x972908) + 1), ST32(0x972904, LD32(0x972904) + 1);
+    ST32(0x9758d0, 0), ST32(0x9758d4, 0);
+}
 #ifdef RC_WTRACE
 void rc_wt_exec_begin(Ctx* c);
 void rc_wt_exec_end(void);
@@ -335,13 +476,14 @@ static uint16_t g_wfcw;
 static SceUID g_wjob, g_wdone;
 volatile int g_wbusy;
 static uint64_t g_wus, g_waitus;  /* worker busy, main waiting at fences (us), for the log */
+volatile uint32_t g_free_gen;  /* anything the game freed: rt_vita.c game_free, f_59dca0 */
 static uint64_t g_t_handoff, g_t_first, g_tick_us, g_first_us;  /* where the first entity matrix lands in the tick */
 static uint64_t g_t_logic;  /* 55d780 (the logic tick) start, while the worker runs */
 static uint32_t g_wframes;
 static int pipe_mode(void) {
     if (g_pipe < 0) {
         const char* e = getenv("USM_PIPE");
-        g_pipe = e ? atoi(e) : 2;  /* on unless pipe.txt / USM_PIPE says otherwise (0 = off) */
+        g_pipe = e ? atoi(e) : 3;  /* on unless pipe.txt / USM_PIPE says otherwise (0 = off) */
 #ifdef USM_DEBUG
         if ((e = getenv("USM_PIPE_DELAY"))) g_wdelay = atoi(e);
 #endif  /* vpc: us per worker draw, to be as slow as the Vita */
@@ -351,6 +493,16 @@ static int pipe_mode(void) {
             if (fscanf(f, "%d", &m) == 1) g_pipe = m;
             fclose(f);
         }
+        /* pipe.txt 2 is what the Settings menu has always saved for "on": mode 3 unless overlap.txt says 0 */
+        if (g_pipe == 2) g_pipe = 3;
+        if ((f = fopen(USM_DIR "overlap.txt", "r"))) {
+            int m = 1;
+            if (fscanf(f, "%d", &m) == 1 && !m && g_pipe == 3) g_pipe = 2;
+            fclose(f);
+        }
+#ifdef USM_DEBUG
+        if ((e = getenv("USM_PIPE"))) g_pipe = atoi(e);  /* vpc: exactly this mode */
+#endif
         if (g_pipe) vlog("pipeline: mode %d (%u per-thread globals)\n", g_pipe, rc_tls_n);
     }
     return g_pipe;
@@ -389,25 +541,54 @@ static void pipe_start(void) {
     g_wjob = sceKernelCreateSema("usm_pipe_job", 0, 0, 1, NULL);
     g_wdone = sceKernelCreateSema("usm_pipe_done", 0, 0, 1, NULL);
     /* started the way the game's own threads are (shims_kernel32.c CreateThread): translated code nests deep on the
-       host stack, and vitaGL's shader compiler may run on top of it */
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, 8 << 20);
+       host stack. EXEC only records commands (shaders compile on the render thread), so a smaller stack still works
+       when memory is short; running without the worker costs about 10% of the frame rate (fast5 vs fast6) */
     pthread_t t;
-    if (g_wjob < 0 || g_wdone < 0 || pthread_create(&t, &a, worker_main, NULL)) {
-        vlog("pipeline: could not start the worker (semaphores %x %x), running without it\n", g_wjob, g_wdone);
+    int err = g_wjob < 0 || g_wdone < 0 ? -1 : 1;
+    for (int mb = 8; mb >= 2 && err > 0; mb /= 2) {
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setstacksize(&a, (unsigned)mb << 20);
+        err = pthread_create(&t, &a, worker_main, NULL);
+        if (!err) vlog("pipeline: worker has a %d MB stack\n", mb);
+    }
+    if (err) {
+        vlog("pipeline: could not start the worker (semaphores %x %x, error %d), running without it\n", g_wjob, g_wdone, err);
         g_pipe = 0;
         return;
     }
     sceKernelWaitSema(g_wdone, 1, NULL);  /* its context is ready */
     vlog("pipeline: worker started\n");
 }
+/* main.c, before the game starts: vitaGL later takes all RAM but its reserve, and the game's threads and movies use
+   that up, so a worker started at the first frame only sometimes got its stack (fast5 did, fast6 did not) */
+void pipe_start_early(void) {
+    if (pipe_mode() > 0 && !g_wc) pipe_start();
+}
 /* wait for the worker, then hand back what it produced. Only the thread that hands EXEC over takes the worker's
    "done" signal; any other thread just waits for it to finish */
 static const char* g_why, *g_waited;  /* the fence being passed; the last one that made main wait (for the log) */
 static Ctx* g_mc;
+static struct { const char* why; uint32_t n, us; } g_fw[12];
+/* shims.c: main's Release of a resource waited for the worker, 18-41 ms each and the game drops several at once (77b2f0, streaming):
+   it waits here for the next fence instead, and until then the object simply stays alive. Off: release_later.txt containing 0 */
+static uint32_t g_rel[256], g_reln;
+int pipe_defer_release(Ctx* c, uint32_t o) {
+    static int on = -1;
+    if (on < 0) {
+        FILE* f = fopen(USM_DIR "release_later.txt", "r");
+        on = 1;
+        if (f) {
+            if (fscanf(f, "%d", &on) != 1) on = 1;
+            fclose(f);
+        }
+    }
+    if (!on || c != g_mc || g_reln == 256) return 0;
+    g_rel[g_reln++] = o;
+    return 1;
+}
 void pipe_fence(void) {
-    if (!g_wbusy) return;
+    if (!g_wbusy || rc_ctx() == g_wc) return;  /* the worker never waits for itself */
     if (rc_ctx() != g_mc) {
         while (g_wbusy) sceKernelDelayThread(100);
         return;
@@ -415,11 +596,21 @@ void pipe_fence(void) {
     g_waited = g_why;
     uint64_t t = sceKernelGetProcessTimeWide();
     sceKernelWaitSema(g_wdone, 1, NULL);
-    g_waitus += sceKernelGetProcessTimeWide() - t;
+    t = sceKernelGetProcessTimeWide() - t;
+    g_waitus += t;
+    for (int i = 0; i < 12; i++)  /* the log: what main waited at */
+        if (!g_fw[i].why || g_fw[i].why == g_why) { g_fw[i].why = g_why, g_fw[i].n++, g_fw[i].us += (uint32_t)t; break; }
     g_wbusy = 0, g_fgen = 0;
+    void game_free_late(void);
+    game_free_late();
+    void slab_free_late_(void);
+    slab_free_late_();
     for (unsigned k = 0; k < rc_tls_n; k++)
         if (rc_tls_flag[k] & 2) memcpy((void*)RC_P(rc_tls_addr0[k]), (void*)RC_P(g_wtls[k]), rc_tls_size[k]);
     gl_set_recorder();
+    void d3d_release_later(uint32_t o);
+    for (uint32_t i = 0; i < g_reln; i++) d3d_release_later(g_rel[i]);
+    g_reln = 0;
 }
 /* shims.c, before a D3D call: main (or any other thread) waits while the worker is drawing */
 void pipe_fence_d3d(Ctx* c, const char* name) {
@@ -456,6 +647,8 @@ static void pipe_handoff(Ctx* c) {
         }
     }
     static uint32_t fseq;
+    pipe_after_handoff();
+    memset(g_rows_m, 0, sizeof g_rows_m), memset(g_rows_w, 0, sizeof g_rows_w);
     g_fgen = ++fseq ? fseq : ++fseq;  /* a new, empty copy-on-write table for this frame */
     g_wbusy = 1;
     if (log_on()) g_t_handoff = sceKernelGetProcessTimeWide(), g_t_first = 0;  /* only for the log line below */
@@ -469,7 +662,34 @@ static void pipe_handoff(Ctx* c) {
              g_tick_us ? 100.0 * g_first_us / g_tick_us : 0.0, g_fsaved / 120.0, g_fhits / 120.0, g_wbones / 120.0,
              g_wstale / 120.0),
             g_wus = g_waitus = g_first_us = g_tick_us = 0, g_fsaved = g_fhits = g_wbones = g_wstale = 0;
+    if (g_wframes % 120 == 0 && log_on()) {
+        static uint64_t last;
+        uint64_t now = sceKernelGetProcessTimeWide();
+        double wall = last ? (double)(now - last) / 1000.0 / 120 : 0, waited = 0;
+        for (int i = 0; i < 12 && g_fw[i].why; i++) waited += g_fw[i].us / 1000.0 / 120;
+        if (last) {
+            vlog("main thread: %.1f ms/frame busy of %.1f (waits at:", wall - waited, wall);
+            for (int i = 0; i < 12 && g_fw[i].why; i++) vlog(" %s %u x %.1f ms", g_fw[i].why, g_fw[i].n, g_fw[i].us / 1000.0 / g_fw[i].n);
+            vlog(")\n");
+        }
+        last = now;
+        memset(g_fw, 0, sizeof g_fw);
+    }
     ret(c, 0);
+}
+#endif
+/* 76e050 resets the scratch arena the render lists live in (base 0x971f08, size 0x971f10) while the worker may still
+   be reading last frame's: each world frame takes the other of two blocks. Frame N's block is free again once EXEC(N) is
+   done, which main waits for at the hand-off of frame N+1, before it gets back here */
+#ifndef RC_WTRACE
+static void arena_flip(void) {
+    static uint32_t a, b;
+    uint32_t base = LD32(0x971f08);
+    if (base != a && base != b) {  /* first time, or the game made a new arena */
+        a = base, b = G(guest_alloc(LD32(0x971f10)));
+        vlog("pipeline: second scratch arena, %u KB\n", LD32(0x971f10) >> 10);
+    }
+    ST32(0x971f08, base == a ? b : a);
 }
 #endif
 /* 73ea70: the world render frame; the pipeline's fence */
@@ -478,7 +698,7 @@ static int g_wt_build;  /* WT_BUILD set: the tracer's EXEC phase is the whole wo
 #endif
 void f_73ea70(Ctx* c) {
 #ifdef RC_WTRACE
-    rc_wt_fence();
+    if (!getenv("WT_OVERLAP")) rc_wt_fence();  /* WT_OVERLAP: trace EXEC against the next build too (fence moved to EXEC) */
     if (getenv("WT_BUILD")) {
         g_wt_build = 1, rc_wt_exec_begin(c);
         fo_73ea70(c);
@@ -486,7 +706,7 @@ void f_73ea70(Ctx* c) {
         return;
     }
 #else
-    if (pipe_mode()) g_why = "73ea70 (next world frame)", pipe_fence();
+    if (pipe_mode() > 0 && g_pipe < 3) g_why = "73ea70 (next world frame)", pipe_fence();
     d3d_frame_fixups();
 #endif
     fo_73ea70(c);
@@ -494,10 +714,50 @@ void f_73ea70(Ctx* c) {
 /* 76e050: begin a render frame (resets the scratch arena the worker's lists live in) */
 void f_76e050(Ctx* c) {
 #ifndef RC_WTRACE
-    if (g_pipe > 0) g_why = "76e050 (a render frame begins)", pipe_fence();
+    if (g_pipe == 3 && LD32(c->esp) == 0x73eaad) arena_flip();  /* the world frame: EXEC may still read the last lists */
+    else if (g_pipe > 0) g_why = "76e050 (a render frame begins)", pipe_fence();
 #endif
     fo_76e050(c);
 }
+/* 52b250, near the end of the build: 619690 under it rewrites the geometry pointers of a set the worker may be drawing
+   (406350). The hand-off's own fence comes soon after, so moving this one could only gain that short gap */
+void f_52b250(Ctx* c) {
+#ifndef RC_WTRACE
+    if (g_pipe > 0) g_why = "52b250 (end of the build)", pipe_fence();  /* main here before the worker ends: worker-bound */
+#endif
+    fo_52b250(c);
+}
+/* 59dca0 (block, its page or 0): the game's small-block pool free, 417 callers. A freed slot goes back on the list at once
+   and the next allocation of that size takes it, so an object the logic tick deletes (crowds, gang fights, mission ends)
+   turned into something else while the worker drew frame N from it: a timer read as a texture pointer, 0x4b. malloc
+   never sees these, so game_free's queue doesn't help. Frees wait here for the fence (GitHub issue 5). */
+#ifndef RC_WTRACE
+#define SLAB_LATE 16384
+static uint32_t g_slab[SLAB_LATE][2];
+static unsigned g_nslab;
+static pthread_mutex_t g_slab_m = PTHREAD_MUTEX_INITIALIZER;
+void f_59dca0(Ctx* c) {
+    g_free_gen++;
+    if (g_wbusy && arg(c, 1)) {
+        pthread_mutex_lock(&g_slab_m);
+        int kept = g_nslab < SLAB_LATE;
+        if (kept) g_slab[g_nslab][0] = arg(c, 1), g_slab[g_nslab][1] = arg(c, 2), g_nslab++;
+        pthread_mutex_unlock(&g_slab_m);
+        if (kept) { ret(c, 0); return; }
+        g_why = "59dca0 (pool free queue full)", pipe_fence();
+    }
+    fo_59dca0(c);
+}
+void slab_free_late_(void) {  /* pipe_fence: main, the worker idle */
+    pthread_mutex_lock(&g_slab_m);
+    unsigned n = g_nslab;
+    g_nslab = 0;
+    pthread_mutex_unlock(&g_slab_m);
+    for (unsigned i = 0; i < n; i++) guest_call(0x59dca0, 2, g_slab[i]);
+}
+#else
+void f_59dca0(Ctx* c) { g_free_gen++; fo_59dca0(c); }
+#endif
 /* 55a680 (a streamed city chunk is parsed) and 509d70 (it spawns an entity through the game allocator 4c1fa0, then
    calls its vtable): the worker must not be inside EXEC meanwhile. Two Vita crashes in exactly this path (4c1fa0 on
    10-28; a vtable slot of -1 called from 509d70 under 55a680 with fast4) while the worker was drawing; the tracer
@@ -507,6 +767,150 @@ void f_55a680(Ctx* c) {
     if (g_pipe > 0) g_why = "55a680 (streaming a city chunk)", pipe_fence();
 #endif
     fo_55a680(c);
+}
+/* Quit: the teardown from 5ad5a9 frees the whole world and never got done on the Vita (the old mixer watchdog closed the
+   app 10 s later). Its first step deletes the game object: leave there, once the quit flag is up (a deletion without it
+   runs as usual), and at 4c2a80, the next step, in case that was skipped. Nothing here saves anything: save games are
+   written when saved, settings by reg_flush */
+static void quit_now(void) {
+    void reg_flush(void);
+    reg_flush();
+    vlog("quit: leaving\n");
+    sceKernelExitProcess(0);
+}
+void f_5e99d0(Ctx* c) {
+    /* only from the teardown's delete: 57b8b3 sets this flag outside quitting too */
+    if (LD8(0x95c178) && LD32(c->esp) == 0x5ad5bb) quit_now();
+    fo_5e99d0(c);
+}
+void f_4c2a80(Ctx* c) { (void)c; quit_now(); }
+/* D3DX's pixel blit: every image the game loads from a file (the Options menu has 41: 11.8 s frozen on the Vita, 75% of it
+   here), through a float per channel per pixel. 32-bit to 32-bit, same size or stretched up, is all the menus need:
+   bilinear in fixed point, ~100x faster. dst/src: {bits, format, pitch, slice pitch, box left top right bottom front back,
+   rect, ...}. Anything else (DXT sources, shrinking) stays with the game's code */
+static uint32_t blit_mix(uint32_t a, uint32_t b, uint32_t f) {  /* f: 0..256 */
+    uint32_t g = 256 - f;
+    return (((a & 0xff00ffu) * g + (b & 0xff00ffu) * f) >> 8 & 0xff00ffu) | (((a >> 8 & 0xff00ffu) * g + (b >> 8 & 0xff00ffu) * f) & 0xff00ff00u);
+}
+static int blit_fast(uint32_t dst, uint32_t src, uint32_t flags, uint32_t* out, uint32_t pitch) {
+    enum { PITCH = 2, L = 4, T = 5, R = 6, B = 7 };
+    #define W_(d, i) LD32((d) + 4 * (i))
+    static uint16_t xi[4096];
+    static uint16_t xf[4096];
+    uint32_t dw = W_(dst, R), dh = W_(dst, B), sw = W_(src, R), sh = W_(src, B), sp = W_(src, PITCH), sb = W_(src, 0);
+    if (W_(dst, 1) != 21 || W_(src, 1) != 21 || (flags & 0xffff) != 3 || flags >> 16 || W_(dst, L) | W_(dst, T) | W_(src, L) | W_(src, T)) return 0;
+    if (!dw || !dh || !sw || !sh || dw > 4096 || sw > dw || sh > dh || W_(dst, 3) | W_(src, 3)) return 0;
+    for (uint32_t x = 0; x < dw; x++) {  /* source position of the pixel's centre */
+        int32_t u = (int32_t)(((uint64_t)(2 * x + 1) * sw << 8) / (2 * dw)) - 128;
+        if (u < 0) u = 0;
+        xi[x] = (uint16_t)(u >> 8), xf[x] = (uint16_t)(u & 255);
+        if (xi[x] >= sw - 1) xi[x] = (uint16_t)(sw - 1), xf[x] = 0;
+    }
+    for (uint32_t y = 0; y < dh; y++) {
+        int32_t v = (int32_t)(((uint64_t)(2 * y + 1) * sh << 8) / (2 * dh)) - 128;
+        if (v < 0) v = 0;
+        uint32_t r0 = (uint32_t)v >> 8, fy = (uint32_t)v & 255;
+        if (r0 >= sh - 1) r0 = sh - 1, fy = 0;
+        const uint32_t* a = (const uint32_t*)RC_P(sb + r0 * sp), *b = (const uint32_t*)RC_P(sb + (fy ? r0 + 1 : r0) * sp);
+        uint32_t* o = (uint32_t*)((uint8_t*)out + y * pitch);
+        for (uint32_t x = 0; x < dw; x++) {
+            uint32_t i = xi[x], j = xf[x] ? i + 1 : i, f = xf[x];
+            o[x] = blit_mix(blit_mix(a[i], a[j], f), blit_mix(b[i], b[j], f), fy);
+        }
+    }
+    #undef W_
+    return 1;
+}
+void f_7d36f3(Ctx* c) {
+    uint32_t dst = LD32(c->esp + 4), src = LD32(c->esp + 8), flags = LD32(c->esp + 12), self = c->ecx;
+    static int off = -1;
+    if (off < 0) {
+        FILE* f = fopen(USM_DIR "fast_blit.txt", "r");
+        int v = 1;
+        if (f) {
+            if (fscanf(f, "%d", &v) != 1) v = 1;
+            fclose(f);
+        }
+        off = !v;
+    }
+#ifdef USM_DEBUG
+    if (getenv("VPC_BLIT_CHECK")) {  /* the game's result against ours: pixels off by more than 16 in a channel */
+        static uint32_t tmp[4096 * 1024];
+        int did = blit_fast(dst, src, flags, tmp, 4096 * 4);
+        fo_7d36f3(c);
+        if (did) {
+            uint32_t w = LD32(dst + 24), h = LD32(dst + 28), bad = 0, worst = 0;
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t x = 0; x < w; x++) {
+                    uint32_t p = LD32(LD32(dst) + y * LD32(dst + 8) + 4 * x), q = tmp[y * 4096 + x], m = 0;
+                    for (int k = 0; k < 32; k += 8) {
+                        int e = abs((int)(p >> k & 255) - (int)(q >> k & 255));
+                        m = (uint32_t)e > m ? (uint32_t)e : m;
+                    }
+                    bad += m > 16, worst = m > worst ? m : worst;
+                }
+            vlog("blit check %ux%u: %u pixels off by more than 16, worst %u\n", w, h, bad, worst);
+        }
+        return;
+    }
+#endif
+    if (!off && LD32(dst + 8) >= 4 * LD32(dst + 24) && blit_fast(dst, src, flags, (uint32_t*)RC_P(LD32(dst)), LD32(dst + 8))) {
+        ST32(self, 0), ST32(self + 4, 0), ST32(self + 8, flags);
+        c->eax = 0;
+        ret(c, 12);
+        return;
+    }
+    fo_7d36f3(c);
+}
+/* Smoke and fire: 75af90 builds every particle of an emitter into quads each frame, on the pipeline worker: 30-50% of its samples
+   in a burning street (760aa0 and its 7 variants, vector math per particle), and main then waits for it at 52b250. An emitter with
+   4 or more particles gets a private copy here that walks every smoke.txt-th one (default 2, 1 = all): count / step at +0x74, stride
+   x step in a copy of its layout (+0x78, stride at +4). The particles the game simulates are not touched. The copy stands in
+   for the emitter, so the axes the renderer computes into it (+0x20..+0x70) go back afterwards */
+void f_75af90(Ctx* c) {
+    static int step = -1;
+    static uint32_t em_copy, lay_copy;
+    if (step < 0) {
+        step = 2;
+        FILE* f = fopen(USM_DIR "smoke.txt", "r");
+        if (f) {
+            if (fscanf(f, "%d", &step) != 1 || step < 1) step = 2;
+            fclose(f);
+        }
+        vlog("smoke: every %d of large emitters' particles (smoke.txt)\n", step);
+    }
+    uint32_t em = LD32(c->esp + 4), n = LD32(em + 0x74);
+    static uint32_t calls, total, big, most;  /* the log: how particles are spread over emitters */
+    static uint64_t told;
+    calls++, total += n, big += n >= 4, most = n > most ? n : most;
+    if (log_on() && calls >= 2000) {
+        uint64_t now = sceKernelGetProcessTimeWide();
+        if (now >= told) vlog("smoke: %u emitters, %u particles, largest %u, %u emitters with 4 or more\n", calls, total, most, big), told = now + 2000000;
+        calls = total = big = most = 0;
+    }
+    if (step < 2 || n < 4) {
+        fo_75af90(c);
+        return;
+    }
+    if (!em_copy) em_copy = G(guest_alloc(0x100)), lay_copy = G(guest_alloc(0x40));
+    uint32_t lay = LD32(em + 0x78);
+    memcpy((void*)RC_P(em_copy), (const void*)RC_P(em), 0x100);
+    memcpy((void*)RC_P(lay_copy), (const void*)RC_P(lay), 0x40);
+    ST32(em_copy + 0x74, n / (uint32_t)step);
+    ST32(em_copy + 0x78, lay_copy);
+    ST32(lay_copy + 4, LD32(lay + 4) * (uint32_t)step);
+    ST32(c->esp + 4, em_copy);
+    fo_75af90(c);
+    memcpy((void*)RC_P(em + 0x20), (const void*)RC_P(em_copy + 0x20), 0x50);
+}
+/* 771e40 copies a mesh's master buffers over the next slot of its ring, every tick (4d2060: morphing faces and the like, 21% of the main
+   thread in that profile). Its Locks waited for the worker, which draws from the previous slot, never this one */
+static volatile int g_ring_copy;
+int pipe_ring_copy(Ctx* c) { return g_ring_copy && c == g_mc; }
+void f_771e40(Ctx* c) {
+    g_ring_copy = c == g_mc;
+    fo_771e40(c);
+    g_ring_copy = 0;
 }
 void f_509d70(Ctx* c) {
 #ifndef RC_WTRACE
@@ -722,8 +1126,29 @@ void f_4db590(Ctx* c) {
 
 /* 55d780: the game's logic tick (game states). Only measured: how far into it the first entity matrix is computed,
    which is how much of the tick can overlap the pipeline's worker before the 4db590 fence */
+static int g_slow;  /* logic ticks running long, 0..16: see f_4a6110 */
+static uint32_t g_tick;  /* logic ticks */
+/* 6bc150: the entity nearest the HERO, a search of the collision grid around him (522c40 -> 5229b0, 3.3% self, the hottest
+   real game code on main). 6d9740 calls it once per car, every tick, with no car in it: every car but the first repeated
+   the same search (5.3% of the mission profile, and in the 250 ms hitch stacks). The answer is a pointer, so a free
+   since the search redoes it: a car may have deleted that entity. */
+void f_6bc150(Ctx* c) {
+    static uint32_t tick = ~0u, gen, r[3];
+    if (tick == g_tick && gen == g_free_gen) {
+        c->eax = r[0], c->ecx = r[1], c->edx = r[2];
+        ret(c, 0);
+        return;
+    }
+    fo_6bc150(c);
+    tick = g_tick, gen = g_free_gen, r[0] = c->eax, r[1] = c->ecx, r[2] = c->edx;
+}
 void f_55d780(Ctx* c) {
+    g_tick++;
 #ifndef RC_WTRACE
+    static uint64_t last;
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    if (t0 - last > 50000) { if (g_slow < 16) g_slow++; } else if (g_slow) g_slow--;
+    last = t0;
     if (g_t_handoff && rc_ctx() == g_mc) {
         g_t_logic = sceKernelGetProcessTimeWide(), g_t_first = 0;
         fo_55d780(c);
@@ -758,6 +1183,7 @@ void f_415a30(Ctx* c) {
 /* 6c2e10: sets the pedestrian density (0x937ff0). The traffic manager 6d8610 recomputes the traffic density
    (0x937ff8, 0.2..1, cars allowed = 30 x it) every logic tick and passes the same value here, so a cap applied once
    per frame (d3d9_null.c cap_density) was undone before the spawners read it. Both are capped here, at the source. */
+float density_cap(void);
 void f_6c2e10(Ctx* c) {  /* cdecl (float) */
     float cap = density_cap(), d;
     uint32_t a = c->esp + 4;
@@ -766,6 +1192,119 @@ void f_6c2e10(Ctx* c) {  /* cdecl (float) */
     if (LDF32(0x937ff8) > cap) STF32(0x937ff8, cap);
     fo_6c2e10(c);
 }
+
+/* 81e430: stereo IMA ADPCM, a nibble per channel, called on the game thread for streamed sound (~2.4% of it): (out,
+   in, samples, predictors[2], step indices[2]). The registers it leaves are nothing a cdecl caller may use */
+static void n_81e430(Ctx* c) {
+    uint32_t n = arg(c, 3);
+    if ((int32_t)n > 0) {
+        const uint8_t* in = (const uint8_t*)RC_P(arg(c, 2));
+        uint8_t* out = (uint8_t*)RC_P(arg(c, 1));
+        rc_u32* pred = (rc_u32*)RC_P(arg(c, 4)), *idx = (rc_u32*)RC_P(arg(c, 5));
+        const rc_u32* steps = (const rc_u32*)RC_P(0x9551f0), *adj = (const rc_u32*)RC_P(0x9551d0);
+        int32_t ch[2][2] = {{(int32_t)pred[0], (int32_t)idx[0]}, {(int32_t)pred[1], (int32_t)idx[1]}};
+        for (uint32_t i = 0; i < n; i++, in++, out += 4)
+            for (int k = 0; k < 2; k++) {
+                int32_t nib = k ? *in >> 4 : *in & 15, m = nib & 7, step = (int32_t)steps[ch[k][1]];
+                int32_t x = ch[k][1] + (int32_t)adj[m];
+                ch[k][1] = x < 0 ? 0 : x > 0x58 ? 0x58 : x;
+                int32_t d = step >> 3;
+                if (m & 4) d += step;
+                if (m & 2) d += step >> 1;
+                if (m & 1) d += step >> 2;
+                int32_t v = nib & 8 ? ch[k][0] - d : ch[k][0] + d;
+                ch[k][0] = v > 0x7fff ? 0x7fff : v < -0x8000 ? -0x8000 : v;
+                out[2 * k] = (uint8_t)ch[k][0], out[2 * k + 1] = (uint8_t)(ch[k][0] >> 8);
+            }
+        pred[0] = (uint32_t)ch[0][0], idx[0] = (uint32_t)ch[0][1], pred[1] = (uint32_t)ch[1][0], idx[1] = (uint32_t)ch[1][1];
+    }
+    ret(c, 0);
+}
+void f_81e430(Ctx* c) { n_81e430(c); }
+/* 81e320: the same decode for one channel (out, in, n, pred, index) */
+static void n_81e320(Ctx* c) {
+    int32_t n = (int32_t)arg(c, 3);
+    if (n > 0) {
+        const uint8_t* in = (const uint8_t*)RC_P(arg(c, 2));
+        uint8_t* out = (uint8_t*)RC_P(arg(c, 1));
+        rc_u32* pp = (rc_u32*)RC_P(arg(c, 4)), *ip = (rc_u32*)RC_P(arg(c, 5));
+        const rc_u32* steps = (const rc_u32*)RC_P(0x9551f0), *adj = (const rc_u32*)RC_P(0x9551d0);
+        int32_t pred = (int32_t)*pp, idx = (int32_t)*ip;
+        for (int32_t i = 0; i < n; i++, out += 2) {
+            int32_t nib = i & 1 ? *in++ >> 4 : *in & 15, m = nib & 7, step = (int32_t)steps[idx];
+            int32_t x = idx + (int32_t)adj[m];
+            idx = x < 0 ? 0 : x > 0x58 ? 0x58 : x;
+            int32_t d = step >> 3;
+            if (m & 4) d += step;
+            if (m & 2) d += step >> 1;
+            if (m & 1) d += step >> 2;
+            int32_t v = nib & 8 ? pred - d : pred + d;
+            pred = v > 0x7fff ? 0x7fff : v < -0x8000 ? -0x8000 : v;
+            out[0] = (uint8_t)pred, out[1] = (uint8_t)(pred >> 8);
+        }
+        *pp = (uint32_t)pred, *ip = (uint32_t)idx;
+    }
+    ret(c, 0);
+}
+void f_81e320(Ctx* c) { n_81e320(c); }
+
+/* The game's state wrappers, ~2,700 calls a frame on the worker, 85% of them setting what is already set. Then nothing
+   changes, so skip the wrapper's guest calls and the shim dispatch: same result, same registers left. A real change takes
+   the original. Only with no second D3D user: main may have to wait for the worker first, which the shim does. */
+void f_772250(Ctx* c) {  /* SetPixelShader(*arg) */
+    uint32_t ps = LD32(arg(c, 1));
+    if (st.ps != ps || (g_wbusy && c != g_wc)) { fo_772250(c); return; }
+    c->eax = 0, c->ecx = LD32(LD32(0x971f94)), c->edx = ps;
+    ret(c, 0);
+}
+void f_772270(Ctx* c) {  /* SetVertexDeclaration(arg[1]), SetVertexShader(arg[0]) */
+    uint32_t a = arg(c, 1), vs = LD32(a), decl = LD32(a + 4);
+    if (st.vs != vs || st.decl != decl || st.fvf || (g_wbusy && c != g_wc)) { fo_772270(c); return; }
+    c->eax = 0, c->ecx = LD32(LD32(0x971f94)), c->edx = vs;
+    ret(c, 0);
+}
+void f_76dc30(Ctx* c) {  /* SetSamplerState(stage, type, value) through the game's own cache at 0x971ff0 */
+    uint32_t s = arg(c, 1), t = arg(c, 2), k = s * 14 + t;
+    if (LD32(0x971ff0 + 4 * k) != arg(c, 3)) { fo_76dc30(c); return; }
+    c->eax = k, c->ecx = s, c->edx = t;
+    ret(c, 0);
+}
+/* 401110: cdecl (out, a, b): out = a + b, the 4 lanes */
+void f_401110(Ctx* c) {
+    uint32_t out = arg(c, 1), a = arg(c, 2), b = arg(c, 3);
+    float x[4], y[4];
+    ldv(x, a), ldv(y, b);
+    for (int i = 0; i < 4; i++) x[i] += y[i];
+    stv(out, x);
+    c->eax = out, c->ecx = b;
+    ret(c, 0);
+}
+#ifdef USM_DEBUG
+/* vpc, USM_ADPCM_CHECK: random blocks through the translation and the native version: same samples and predictors */
+void adpcm_selftest(void) {
+    if (!getenv("USM_ADPCM_CHECK")) return;
+    enum { N = 4096 };
+    Ctx* c = rc_ctx();
+    uint32_t in = G(guest_alloc(N)), out = G(guest_alloc(N * 4)), st = G(guest_alloc(16)), sp = c->esp, bad = 0, r[N + 4];
+    for (int t = 0; t < 2000; t++) {
+        uint32_t x = (uint32_t)rand() * 2654435761u, st0[4] = {(uint16_t)x - 32768u + 0u, (uint32_t)rand() % 65536 - 32768, rand() % 89u, rand() % 89u}, n = 1 + rand() % N;
+        for (uint32_t i = 0; i < n; i++) ST8(in + i, rand());
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < 4; i++) ST32(st + 4 * i, st0[i]);
+            memset((void*)RC_P(out), 0, N * 4);
+            c->esp = sp - 32;
+            uint32_t a[6] = {0, out, in, n, st, st + 8};
+            for (int i = 0; i < 6; i++) ST32(c->esp + 4 * i, a[i]);
+            if (t & 1) (pass ? n_81e320 : fo_81e320)(c);
+            else (pass ? n_81e430 : fo_81e430)(c);
+            if (!pass) { memcpy(r, (void*)RC_P(out), N * 4); memcpy(r + N, (void*)RC_P(st), 16); }
+        }
+        bad += memcmp(r, (void*)RC_P(out), N * 4) || memcmp(r + N, (void*)RC_P(st), 16);
+    }
+    c->esp = sp;
+    vlog("adpcm selftest: 2000 blocks, %u differ\n", bad);
+}
+#endif
 
 /* 4a6110: one character's animation step (thiscall: animator, dt, flag; ret 8): advance its clips by dt (4b06a0),
    build the pose (4b0860), apply it. 537170 calls it for every animated character every logic tick: ~21% of the
@@ -794,7 +1333,13 @@ void f_4a6110(Ctx* c) {
         if (m && hm) {
             float dx = LDF32(m + 0x30) - LDF32(hm + 0x30), dy = LDF32(m + 0x34) - LDF32(hm + 0x34),
                   dz = LDF32(m + 0x38) - LDF32(hm + 0x38);
-            if (dx * dx + dy * dy + dz * dz > far * far) {
+            float d2 = dx * dx + dy * dy + dz * dz;
+            /* a crowd (gang fights, ~1.5 min after a mission: 6 fps with 21% of the frame here, prof6): while ticks run
+               long, half rate from a third of the distance and quarter rate past it. Set off by g_slow, so a calm
+               street stays as it was; the hero never steps late */
+            int busy = g_slow >= 8;
+            uint32_t mask = busy && d2 > far * far ? 3 : 1;
+            if (busy ? d2 > far * far / 9 : d2 > far * far) {
                 static struct { uint32_t key; float acc; } slot[1024];
                 extern uint32_t d3d_frame_count(void);
                 uint32_t i = ((self >> 4) * 2654435761u) >> 22;
@@ -806,8 +1351,8 @@ void f_4a6110(Ctx* c) {
                 }
                 static int said;
                 if (!said) said = 1, vlog("animation: first half-rate character %x, %.0f m from the hero %x\n", ent,
-                                          sqrtf(dx * dx + dy * dy + dz * dz), hero);
-                if (((self >> 4) ^ d3d_frame_count()) & 1) {  /* this tick: skipped, its time kept */
+                                          sqrtf(d2), hero);
+                if (((self >> 4) + d3d_frame_count()) & mask) {  /* this tick: skipped, its time kept */
                     /* through the function's own early exit (byte +0x50 set = "don't step"), not a bare return: it
                        is called through a vtable, and the caller relies on the translation's register write-back */
                     slot[i].acc += dt;

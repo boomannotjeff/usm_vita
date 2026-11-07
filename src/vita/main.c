@@ -96,6 +96,13 @@ static uint32_t load_exe(void) {
     }
     uint32_t entry = base + *(uint32_t*)(file + pe + 40);
     free(file);
+    /* The game's default bindings (rows of 0x48 bytes, pad slot at +0x40 = device << 16 | code) have no pad binding for web,
+       zip and the camera. shims_misc.c adds them to the registry at boot, but Revert to Default on the Controls page
+       copies this table over the live bindings and saves them: the right stick and R/L died until the next boot
+       (GitHub issues 3, 6). input.c: button 5 L, 6 R, 9 rear touch, right stick on Z (5/6) and Rz (11/12) */
+    static const struct { uint32_t row, code; } pad[] = {{0x88d888, 0x1a}, {0x88d8d0, 0x19}, {0x88d918, 0x0c}, {0x88d960, 0x0b},
+                                                         {0x88d9a8, 0x06}, {0x88d9f0, 0x05}, {0x88da38, 0x1d}};
+    for (unsigned i = 0; i < sizeof pad / sizeof *pad; i++) *(uint32_t*)(image + pad[i].row - base + 0x40) = 3u << 16 | pad[i].code;
     vlog("USM.exe loaded at %p (guest %06x), %u imports bound\n", image, base, bound);
     return entry;
 }
@@ -112,6 +119,7 @@ int main(void) {
     vlog("usm.vpk started (build " __DATE__ " " __TIME__ ", heap %d MB, image at %p)\n", _newlib_heap_size_user >> 20, g_image);
     if (!g_image) { vlog("out of memory for the image\n"); sceKernelExitProcess(1); return 1; }
     extern int g_shim_verbose;
+    { extern int g_shim_trace; g_shim_trace = log_on(); }
     FILE* t = fopen(USM_DIR "trace.txt", "r");
     if (t) fclose(t), g_shim_verbose = 1, vlog("trace.txt found: logging every shim call\n");
     scePowerSetArmClockFrequency(444);
@@ -128,6 +136,14 @@ int main(void) {
     uint32_t entry = load_exe();
     if (!entry) fatal("Cannot load " USM_DIR "USM.exe.\nCopy USM.exe and the Data folder of your PC install to " USM_DIR);
     Ctx* c = ctx_new(0x100000);
+#ifndef RC_WTRACE
+    void pipe_start_early(void);
+    pipe_start_early();
+#ifdef USM_DEBUG
+    void adpcm_selftest(void);
+    adpcm_selftest();
+#endif
+#endif
 #ifdef RC_PROFILE
     rc_prof_start(c);
 #else

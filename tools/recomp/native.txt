@@ -24,3 +24,23 @@
 55a680 streamed city chunk parse (pipeline fence)
 509d70 streamed entity spawn (pipeline fence)
 4a6110 character animation step (far characters every other tick)
+52b250 end of the render list build (pipeline fence before 619690)
+81e430 stereo IMA ADPCM decode
+59dca0 small-block pool free (held while the pipeline worker draws)
+4c2a80 first call of the quit teardown (the app ends here: saves are already on disk)
+7d36f3 D3DX pixel blit (native fast path for plain copies: the Options menu loads 41 images through it)
+5e99d0 game object destructor (the slow part of quitting: the app ends here when the quit flag is set)
+75af90 particle emitter render (big emitters draw every Nth particle)
+771e40 mesh ring copy (its buffer locks need no pipeline fence)
+75b9e0 particle: packed vertex
+75b950 particle: colour to bytes
+75bf10 particle: random vector
+75b870 particle: table lookup
+5044f0 vector sine (four ceil imports a call)
+411ac0 C += v * p.z
+81e320 mono IMA ADPCM decode
+772250 SetPixelShader wrapper (nothing to do when unchanged)
+772270 SetVertexDeclaration + SetVertexShader wrapper (nothing to do when unchanged)
+76dc30 sampler state through the game's cache (nothing to do when unchanged)
+401110 vector add
+6bc150 nearest entity to the hero (same search for every car in a tick)

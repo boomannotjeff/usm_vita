@@ -36,26 +36,44 @@ typedef struct {
 static const Setting S[] = {
     {"People and traffic", "density.txt", 6, 1, {"0", "0.15", "0.3", "0.5", "0.75", "1"},
      {"None", "Very low", "Low", "Medium", "High", "Like PC"}, "The biggest speed setting. PC game: Like PC."},
-    {"View distance", "distance.txt", 6, 2, {"80", "100", "120", "150", "200", "0"},
-     {"80 m", "100 m", "120 m", "150 m", "200 m", "Everything, no fog"}, "Past it the city fades into fog."},
-    {"Resolution", "resolution.txt", 5, 3, {"480x272", "544x308", "640x362", "720x408", "960x544"},
+    {"View distance", "distance.txt", 7, 2, {"80", "100", "120", "150", "200", "300", "0"},
+     {"80 m", "100 m", "120 m", "150 m", "200 m", "300 m", "Everything, no fog"}, "Past it the city fades into fog. Longer costs frame rate."},
+    {"Resolution", "resolution.txt", 5, 4, {"480x272", "544x308", "640x362", "720x408", "960x544"},
      {"480x272", "544x308", "640x362", "720x408", "960x544 (full)"}, "The 3D scene's size, scaled to the screen."},
     {"Texture size", "texture_max.txt", 4, 1, {"128", "256", "512", "0"}, {"128", "256", "512", "Full"},
      "Largest texture kept. Bigger looks sharper, uses more memory."},
+    {"World texture detail", "dxt_native.txt", 4, 2, {"0", "3", "2", "1"}, {"Old (blurry)", "Low", "Medium", "High"},
+     "High is sharpest, but far walls shimmer more."},
     {"Far characters", "anim_half.txt", 5, 2, {"0", "8", "12", "20", "40"},
      {"Full rate", "Half rate past 8 m", "Half rate past 12 m", "Half rate past 20 m", "Half rate past 40 m"},
      "Characters far from Spider-Man animate every other frame."},
     {"Far objects", "build_cull.txt", 4, 2, {"0", "1.5", "2", "3"},
      {"Game's own (3 km)", "1.5 x view distance", "2 x view distance", "3 x view distance"},
      "How far the game still prepares objects."},
-    {"Frame rate cap", "fps_cap.txt", 4, 0, {"0", "20", "25", "30"}, {"None", "20 fps", "25 fps", "30 fps"},
+    {"Frame rate cap", "fps_cap.txt", 4, 2, {"0", "20", "30", "60"}, {"None", "20 fps", "30 fps", "60 fps"},
      "A steady rate can feel smoother than a varying one."},
+    {"Fog in cutscenes", "cut_fog.txt", 2, 0, {"0", "1"}, {"Off", "On"},
+     "Off shows the far city in cutscenes, which may slow them down."},
+    {"Smoke and fire detail", "smoke.txt", 3, 1, {"1", "2", "3"}, {"Full", "Medium", "Low"},
+     "Lower draws fewer puffs. Explosions run a lot smoother."},
+    {"Map detail", "map_lod.txt", 4, 2, {"0", "2", "4", "8"}, {"Full (can glitch)", "High", "Medium", "Low"},
+     "How much small detail the map drops when zoomed far out."},
+    {"Language", "language.txt", 5, 0, {"0", "1", "2", "3", "4"}, {"English", "French", "German", "Spanish", "Italian"},
+     "Needs that language's game files in Data, else English."},
     {"DEBUG: write log.txt", "debug.txt", 2, 0, {NULL, ""}, {"Off", "On"},
      "Frame times, settings in use and errors, in ux0:data/usm/log.txt."},
     {"DEBUG: early cull", "early_cull.txt", 3, 1, {"0", "1", "2"}, {"Off", "On", "Check (logs mistakes)"},
      "Skips far objects before the game prepares them."},
     {"DEBUG: second core", "pipe.txt", 2, 1, {"0", "2"}, {"Off", "On"},
      "Draws on a second CPU core. Off only to look for bugs."},
+    {"DEBUG: more overlap", "overlap.txt", 2, 1, {"0", "1"}, {"Off", "On"},
+     "Second core also runs while the next frame is prepared."},
+    {"DEBUG: GL state cache", "gl_cache.txt", 2, 1, {"0", "1"}, {"Off", "On"},
+     "Skips repeated graphics calls. Off only to look for bugs."},
+    {"DEBUG: late release", "release_later.txt", 2, 1, {"0", "1"}, {"Off", "On"},
+     "Fewer pauses when the game drops graphics data."},
+    {"DEBUG: display sync", "vsync.txt", 2, 1, {"0", "1"}, {"Off", "On"},
+     "Holds the frame rate cap on the display's refresh."},
     {"DEBUG: frame dumps", "dump.txt", 3, 0, {NULL, "5", "1"}, {"Off", "Every 5 s", "Every second"},
      "Pictures + draw lists in ux0:data/usm/frames. Very slow."},
 };
@@ -122,7 +140,7 @@ void settings_run(void) {
     uint32_t* base;
     SceUID mem = sceKernelAllocMemBlock("usm_settings_fb", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 2 * FB, NULL);
     if (mem < 0 || sceKernelGetMemBlockBase(mem, (void**)&base) < 0) sceKernelExitProcess(0);
-    int v[N], was[N], sel = 0, hold = 0, page = 0;
+    int v[N], was[N], sel = 0, hold = 0, page = 0, top = 0;
     for (int i = 0; i < N; i++) v[i] = was[i] = load(&S[i]);
     uint32_t prev = ~0u;  /* ignore the buttons held while launching */
     for (;;) {
@@ -149,8 +167,11 @@ void settings_run(void) {
         rect(0, 0, W, H, 0xff201010);  /* dark blue */
         rect(0, 0, W, 56, 0xff2828c0);  /* red title bar */
         text(28, 14, "Ultimate Spider-Man  -  Settings", 0xffffffff);
-        for (int i = 0; i < N; i++) {
-            int y = 66 + i * 33;  /* 12 rows end above the help bar (H - 76) */
+        enum { ROWS = 14 };  /* what fits above the help bar (H - 76): the list scrolls to keep the selection in view */
+        if (sel < top) top = sel;
+        if (sel >= top + ROWS) top = sel - ROWS + 1;
+        for (int i = top; i < N && i < top + ROWS; i++) {
+            int y = 62 + (i - top) * 29;
             if (i == sel) rect(16, y - 2, W - 32, 31, 0xff60402a);
             text(32, y, S[i].name, i == sel ? 0xffffffff : 0xffc8c8c8);
             char lab[96];
@@ -160,6 +181,8 @@ void settings_run(void) {
         rect(0, H - 76, W, 76, 0xff100808);
         text(28, H - 70, S[sel].help, 0xffd0d0d0);
         text(28, H - 38, "Cross: save and quit     Circle: quit     Triangle: defaults", 0xff40d0ff);
+        if (top > 0) text(W - 44, 14, "^", 0xffffffff);
+        if (top + ROWS < N) text(W - 44, H - 38, "more", 0xff40d0ff);
         SceDisplayFrameBuf fb = {sizeof fb, g_fb, W, SCE_DISPLAY_PIXELFORMAT_A8B8G8R8, W, H};
         sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
         sceDisplayWaitVblankStart();

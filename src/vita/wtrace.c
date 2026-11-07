@@ -71,6 +71,7 @@ static void trace_access(uint32_t a, uint32_t size, int write) {
             Word* x = word(w, 0);  /* EXEC's record from the EXEC that just ran (same g_frame) */
             if (!x) continue;
             if (write && x->rd) hazard(w, cur_fn(), x->fn, 0);
+            else if (write && x->wr) hazard(w, cur_fn(), x->fn, 2);  /* both write it: fine in turns, a race when overlapped */
             if (!write && x->wr) hazard(w, cur_fn(), x->fn, 1);
         }
     }
@@ -102,7 +103,7 @@ static void dump(void) {
     if (!f) return;
     fprintf(f, "# %u frames: kind word main-function exec-function count\n", g_frame);
     for (int i = 0; i < n; i++)
-        fprintf(f, "%s %08x %06x %06x %u  main callers %06x %06x %06x\n", s[i].kind ? "main-reads-exec-write" : "main-writes-exec-read",
+        fprintf(f, "%s %08x %06x %06x %u  main callers %06x %06x %06x\n", s[i].kind == 2 ? "both-write" : s[i].kind ? "main-reads-exec-write" : "main-writes-exec-read",
                 s[i].a, s[i].main_fn, s[i].exec_fn, s[i].n, s[i].up1, s[i].up2, s[i].up3);
     for (int i = 0; i < 256 && g_shim[i].name; i++) fprintf(f, "exec-shim %s %u\n", g_shim[i].name, g_shim[i].n);
     for (int i = 0; i < 256 && g_mshim[i].name; i++)
@@ -112,14 +113,35 @@ static void dump(void) {
 /* f_76ea10 (native.c) brackets EXEC; MAIN is the game thread the rest of the time, from the first EXEC on */
 void rc_wt_exec_begin(Ctx* c) {
     g_c = c;
-    g_stack_lo = c->esp - 0x200000, g_stack_hi = c->esp + 0x200000;  /* the game thread's guest stack */
+    /* the game thread's guest stack, from its TEB: a guess around esp can swallow the image's globals */
+    g_stack_lo = LD32(c->fsbase + 8), g_stack_hi = LD32(c->fsbase + 4);
     g_frame++, g_phase = 2, rc_wt_on = 1;
+    /* WT_OVERLAP: EXEC on the worker's private copies, as with the pipeline on: what is left on the real addresses is
+       what tls.txt does not cover (reached through a pointer), and the game runs on pipe_after_handoff's results */
+    if (getenv("WT_OVERLAP")) {
+        static uint32_t copy[16];
+        for (unsigned k = 0; k < rc_tls_n; k++)
+            if ((rc_tls_flag[k] & 9) == 1) {
+                if (!copy[k]) copy[k] = G(guest_alloc(rc_tls_size[k] + 16));
+                memcpy((void*)RC_P(copy[k]), (void*)RC_P(rc_tls_addr0[k]), rc_tls_size[k]);
+                c->tls[k] = copy[k];
+            }
+    }
 }
 /* f_73ea70 (the render frame: begin, build, EXEC) is where a pipelined main thread waits for the previous EXEC, so
    MAIN only overlaps EXEC from the hand-off to here (the logic tick): stop tracing MAIN at the fence */
 void rc_wt_fence(void) { if (g_phase == 1) g_phase = 0, rc_wt_on = 0; }
 void rc_wt_exec_end(void) {
     g_phase = 1;  /* rc_wt_on stays set: MAIN is traced from here to the fence */
+    if (getenv("WT_OVERLAP")) {
+        void pipe_after_handoff(void);
+        int on = rc_wt_on;
+        rc_wt_on = 0;
+        pipe_after_handoff();
+        rc_wt_on = on;
+        for (unsigned k = 0; k < rc_tls_n; k++)
+            if ((rc_tls_flag[k] & 9) == 1) g_c->tls[k] = rc_tls_addr0[k];
+    }
     if (g_frame % 300 == 0) dump(), vlog("hazards: %u frames, hazards.txt written\n", g_frame);
 }
 #endif

@@ -253,8 +253,10 @@ static void* io_main(void* arg) {
         int n = r->write_ ? (int)pwrite(r->fd, H(r->buf), r->n, at) : (int)pread(r->fd, H(r->buf), r->n, at);
         pthread_mutex_unlock(&g_io_busy);
         if (n < 0) n = 0;
-        ST32(r->ov + 4, (uint32_t)n), ST32(r->ov, 0);  /* Internal: STATUS_SUCCESS */
-        apc_push(r->to, (Apc){r->fn, 0, (uint32_t)n, r->ov});
+        ST32(r->ov + 4, (uint32_t)n);
+        __sync_synchronize();  /* GetOverlappedResult on another core: the data and count before the status */
+        ST32(r->ov, 0);  /* Internal: STATUS_SUCCESS */
+        if (r->fn) apc_push(r->to, (Apc){r->fn, 0, (uint32_t)n, r->ov});
         free(r);
     }
     return NULL;
@@ -269,7 +271,7 @@ static void io_cancel(uint32_t h, ApcQueue* q) {
             *p = r->next;
             g_io_depth--, g_io_aborted++;
             ST32(r->ov + 4, 0), ST32(r->ov, 0xc0000120u);  /* STATUS_CANCELLED */
-            apc_push(r->to, (Apc){r->fn, 995, 0, r->ov});
+            if (r->fn) apc_push(r->to, (Apc){r->fn, 995, 0, r->ov});
             free(r);
         } else
             last = r, p = &r->next;
@@ -277,17 +279,19 @@ static void io_cancel(uint32_t h, ApcQueue* q) {
     g_io_tail = last;
     pthread_mutex_unlock(&g_io_m);
 }
+static void io_start(void) {
+    static int started;
+    if (started) return;
+    pthread_t io;
+    pthread_attr_t at;
+    pthread_attr_init(&at), pthread_attr_setstacksize(&at, 0x10000);
+    started = pthread_create(&io, &at, io_main, NULL) == 0;
+    if (!started) vlog("ReadFileEx: no I/O thread\n");
+}
 static void file_ex(Ctx* c, int write_) {  /* (h, buf, n, ov, completion) */
     Obj* o = h_get(ARG(0));
     if (!o || o->kind != H_FILE) { set_error(c, 6); c->eax = 0; return; }  /* ERROR_INVALID_HANDLE */
-    static int started;
-    if (!started) {
-        pthread_t io;
-        pthread_attr_t at;
-        pthread_attr_init(&at), pthread_attr_setstacksize(&at, 0x10000);
-        started = pthread_create(&io, &at, io_main, NULL) == 0;
-        if (!started) vlog("ReadFileEx: no I/O thread\n");
-    }
+    io_start();
     IoReq* r = malloc(sizeof *r);
     *r = (IoReq){NULL, apc_queue(), ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), o->fd, write_};
     ST32(r->ov, 0x103), ST32(r->ov + 4, 0);  /* STATUS_PENDING */
@@ -302,7 +306,16 @@ static void file_ex(Ctx* c, int write_) {  /* (h, buf, n, ov, completion) */
     pthread_mutex_unlock(&g_io_m);
     c->eax = 1;
 }
-static void ReadFileEx_(Ctx* c) { file_ex(c, 0); }
+/* City streaming reads a .PCPACK over the memory of the chunk it replaces, which the pipeline's worker may still be
+   drawing from: it read raw file bytes as pointers (a texture of 0x4b; the 4c1fa0 and vtable -1 crashes). So the worker
+   finishes first. The 55a680/509d70 fences in native.c come after the read, too late for this */
+static void ReadFileEx_(Ctx* c) {
+#ifndef RC_WTRACE
+    void pipe_fence_d3d(Ctx* c, const char* name);
+    pipe_fence_d3d(c, "ReadFileEx (streaming over a city chunk)");
+#endif
+    file_ex(c, 0);
+}
 static void WriteFileEx_(Ctx* c) { file_ex(c, 1); }
 static void CancelIo_(Ctx* c) { io_cancel(ARG(0), apc_queue()); c->eax = 1; }
 static void SleepEx_(Ctx* c) {  /* (ms, alertable): WAIT_IO_COMPLETION (0xc0) if completions ran */
@@ -398,10 +411,31 @@ static void FormatMessageA_(Ctx* c) {  /* (flags, source, id, lang, out, size, a
     c->eax = (uint32_t)strlen(m);
 }
 static void ExitThread_(Ctx* c);
+static int g_async_read = 1;
+/* The sound streamer (81f18e) reads music and speech with overlapped ReadFile and polls GetOverlappedResult, no event. Done
+   here that read blocked the game thread on the memory card, for however long the card took: a stutter. So it goes to the
+   I/O thread, ahead of the city's big reads (a stream may not run dry behind them). */
+static void read_async(Ctx* c, Obj* o, uint32_t ov) {
+    IoReq* r = malloc(sizeof *r);
+    *r = (IoReq){NULL, apc_queue(), ARG(0), ARG(1), ARG(2), ov, 0, o->fd, 0};
+    ST32(ov, 0x103), ST32(ov + 4, 0);  /* STATUS_PENDING */
+    io_start();
+    pthread_mutex_lock(&g_io_m);
+    r->next = g_io_head, g_io_head = r;
+    if (!g_io_tail) g_io_tail = r;
+    g_io_depth++;
+    pthread_cond_signal(&g_io_cv);
+    pthread_mutex_unlock(&g_io_m);
+    set_error(c, 997), c->eax = 0;  /* ERROR_IO_PENDING */
+}
 static void ReadFile_(Ctx* c) {
     Obj* o = h_get(ARG(0));
     uint32_t ov = ARG(4);
     if (!o || o->kind != H_FILE) { c->eax = 0; return; }
+#ifdef USM_DEBUG
+    if (getenv("VPC_SYNC_READ")) g_async_read = 0;
+#endif
+    if (ov && o->overlapped && !LD32(ov + 16) && g_async_read) { read_async(c, o, ov); return; }
     int n = ov ? (int)pread(o->fd, H(ARG(1)), ARG(2), (off_t)LD32(ov + 8))  /* OVERLAPPED.Offset: done at once */
                : (int)read(o->fd, H(ARG(1)), ARG(2));
     if (n < 0) n = 0;
@@ -416,7 +450,17 @@ static void ReadFile_(Ctx* c) {
     }
     c->eax = 1;
 }
-static void GetOverlappedResult_(Ctx* c) { ST32(ARG(2), LD32(ARG(1) + 4)); c->eax = 1; }
+static void GetOverlappedResult_(Ctx* c) {  /* (h, ov, bytes, wait) */
+    uint32_t ov = ARG(1);
+    while (LD32(ov) == 0x103) {
+        if (!ARG(3)) { set_error(c, 996); c->eax = 0; return; }  /* ERROR_IO_INCOMPLETE */
+        sceKernelDelayThread(200);
+    }
+    __sync_synchronize();
+    if (LD32(ov) == 0xc0000120u) { set_error(c, 995); c->eax = 0; return; }  /* cancelled */
+    ST32(ARG(2), LD32(ov + 4));
+    c->eax = 1;
+}
 static void WriteFile_(Ctx* c) {
     Obj* o = h_get(ARG(0));
     int n = o && o->kind == H_FILE ? (int)write(o->fd, H(ARG(1)), ARG(2)) : -1;

@@ -6,6 +6,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <psp2/audioout.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <stdlib.h>
 

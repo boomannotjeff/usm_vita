@@ -33,10 +33,13 @@ static float bb_scale, bb_ox, bb_oy;
 static GLuint g_fb;
 static GLuint g_white, g_black, g_glyphs;  /* g_glyphs: the button icons (glyphs.h) */
 static uint32_t g_arrays;  /* attribute arrays enabled */
+static int g_gc_off;  /* the state cache (below) */
+static void gc_reset(void);
 static double g_dump_every;  /* seconds between frame dumps (dump_frame), 0: off */
 static FILE* g_report;       /* open while the frame being dumped draws */
 static Res* g_last_rt;       /* the texture target last drawn into in that frame */
 
+uint64_t g_present_us;  /* render thread: in the cap and the swap, so not work (the report) */
 static GLuint solid(uint32_t rgba) {
     GLuint t;
     glGenTextures(1, &t);
@@ -44,6 +47,15 @@ static GLuint solid(uint32_t rgba) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &rgba);
     return t;
 }
+
+#ifndef USM_VPC
+/* Every draw's uniforms come from here (vita/CMakeLists.txt --wrap). vitaGL's own version is a fixed 2 MB pool that wraps within a
+   frame, over uniforms the GPU has not read yet. A shader indexing its constants uploads all of vc[96], ~1.6 KB a draw, so past ~1,300
+   of them boxes of the far city landed all over the screen in random colours (GitHub issue 2, the map past 500 m, no-fog cutscenes).
+   This pool is per frame, 32 MB over 3 frames, and spills instead of wrapping */
+extern uint8_t* vgl_reserve_data_pool(uint32_t size);
+void* __wrap_vglReserveUniformCircularPoolBuffer(uint32_t size) { return vgl_reserve_data_pool((size + 3) & ~3u); }
+#endif
 
 static void init_(uint32_t bw, uint32_t bh) {
     static int done;
@@ -55,9 +67,25 @@ static void init_(uint32_t bw, uint32_t bh) {
     vlog("gl: backbuffer %ux%u at %.3fx, offset %.0f,%.0f\n", g_bw, g_bh, g_scale, g_ox, g_oy);
     if (done) return;
     done = 1;
-    vglInitExtended(0, 960, 544, 8 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);  /* 8 MB of RAM left to the system */
+#ifndef USM_VPC
+    vglSetParamBufferSize(32 * 1024 * 1024);
+    vglSetVDMBufferSize(256 * 1024);
+    vglSetVertexBufferSize(4 * 1024 * 1024);
+    vglSetFragmentBufferSize(1024 * 1024);
+#endif
+    vglInitExtended(0, 960, 544, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);  /* RAM left to the system: thread stacks, movies */
     cg_log = vlog;
-    FILE* d = fopen(USM_DIR "dump.txt", "r");
+    FILE* d = fopen(USM_DIR "gl_cache.txt", "r");
+    if (d) {
+        int on = 1;
+        if (fscanf(d, "%d", &on) == 1) g_gc_off = !on;
+        fclose(d);
+    }
+#ifdef USM_DEBUG
+    if (getenv("VPC_GL_CACHE")) g_gc_off = !atoi(getenv("VPC_GL_CACHE"));
+#endif
+    vlog("gl: state cache %s (gl_cache.txt)\n", g_gc_off ? "off" : "on");
+    d = fopen(USM_DIR "dump.txt", "r");
     if (d) {
         if (fscanf(d, "%lf", &g_dump_every) == 1) mkdir(USM_DIR "frames", 0777), vlog("gl: dumping a frame every %.1f s\n", g_dump_every);
         fclose(d);
@@ -85,6 +113,8 @@ static int to_backbuffer(void) { return !st.rt[0] || st.rt[0] == g_backbuffer; }
 static volatile int g_world_fog = 1;
 static uint32_t g_world_draws;  /* this frame's fogged, depth-writing full-view draws (recording side) */
 static uint32_t g_world_back;   /* times the world view came back (after a mission, the map, a cutscene) */
+extern volatile int g_cutscene;  /* d3d9_null.c cut_no_fog: the far city draws then too, up to 3x the usual draws */
+static uint32_t g_map_seen, g_map_load;  /* static draws offered this frame / the last frame, on the map */
 static int main_view(const D3DState* s) {
     uint32_t w = bb_w, h = bb_h;
     if (s->rt[0] && s->rt[0] != g_backbuffer) {
@@ -123,12 +153,13 @@ static int bind_target(void) {
             GLenum ok = glCheckFramebufferStatus(GL_FRAMEBUFFER);
             vlog("gl: render target %ux%u format %u%s\n", t->w, t->h, t->fmt, ok == GL_FRAMEBUFFER_COMPLETE ? "" : " INCOMPLETE");
             t->uploaded = 1;
+            gc_reset();
         }
         fb = t->fbo;
         if (g_report) g_last_rt = t;
         g_bw = t->w, g_bh = t->h, g_scale = 1, g_ox = g_oy = 0, g_flip = -1;
     }
-    if (fb != g_fb) glBindFramebuffer(GL_FRAMEBUFFER, g_fb = fb);
+    if (fb != g_fb) glBindFramebuffer(GL_FRAMEBUFFER, g_fb = fb), gc_reset();
     return 1;
 }
 
@@ -138,6 +169,28 @@ static void rect_gl(float x, float y, float w, float h, GLint* o) {
     o[2] = (GLint)(w * g_scale + 0.5f), o[3] = (GLint)(h * g_scale + 0.5f);
 }
 static float vpf(int i) { float f; memcpy(&f, &st.viewport[i], 4); return f; }
+static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+
+/* The render thread's shadow of the GL state set per draw: a call goes to vitaGL only when its arguments changed (a draw
+   sent ~30 state calls, 2/3 of the render thread's time was outside glDraw). run() clears it after every command that
+   is not a draw and bind_target after a target change, so the raw GL calls elsewhere need no care.
+   Off: ux0:data/usm/gl_cache.txt containing 0 */
+enum { GC_VIEW, GC_DEPTHR, GC_SCIS_EN, GC_SCIS, GC_DEPTH_EN, GC_DFUNC, GC_DMASK, GC_POLY_EN, GC_POLY, GC_CULL_EN, GC_FRONT,
+       GC_BLEND_EN, GC_BFUNC, GC_BEQ, GC_CMASK, GC_ST_EN, GC_SFUNC, GC_SOP, GC_SMASK, GC_PROG, GC_VB, GC_IB, GC_TEX,
+       GC_ATTR = GC_TEX + 4, GC_CONST = GC_ATTR + 16, GC_N = GC_CONST + 16 };
+static uint32_t g_gc[GC_N][5];  /* the last arguments, [4]: valid */
+static int g_gc_state;  /* apply_state is up to date for this rhw + 1 (0: no); a state patch clears it */
+static void gc_reset(void) { memset(g_gc, 0, sizeof g_gc), g_gc_state = 0; }
+#define GC(slot, a, b, c, d, call)                                                                        \
+    do {                                                                                                  \
+        uint32_t* g_ = g_gc[slot];                                                                        \
+        uint32_t a_ = (uint32_t)(a), b_ = (uint32_t)(b), c_ = (uint32_t)(c), d_ = (uint32_t)(d);          \
+        if (!g_[4] || g_[0] != a_ || g_[1] != b_ || g_[2] != c_ || g_[3] != d_) {                         \
+            g_[0] = a_, g_[1] = b_, g_[2] = c_, g_[3] = d_, g_[4] = 1;                                    \
+            call;                                                                                         \
+        }                                                                                                 \
+    } while (0)
+#define GC_EN(slot, on, cap) GC(slot, !!(on), 0, 0, 0, (on) ? glEnable(cap) : glDisable(cap))
 
 /* Frame dumps, for comparing against the PC: USM_DIR "dump.txt" holding N makes every frame N seconds apart go to
    USM_DIR "frames/fNNNNN.bmp", with a report of each of its draws in fNNNNN.txt. */
@@ -198,13 +251,21 @@ static void pace(void) {
     static int cap = -1;
     static uint64_t next;
     if (cap < 0) {
-        cap = 0;
+        cap = 30;
         FILE* f = fopen(USM_DIR "fps_cap.txt", "r");
         if (f) {
             if (fscanf(f, "%d", &cap) != 1 || cap < 5 || cap > 60) cap = 0;
             fclose(f);
         }
-        vlog("gl: fps cap %d (fps_cap.txt)\n", cap);
+        int vs = 1;  /* a cap that divides the screen's 60 Hz is held by the display itself: even frames, no sleeping */
+        if ((f = fopen(USM_DIR "vsync.txt", "r"))) {
+            if (fscanf(f, "%d", &vs) != 1) vs = 1;
+            fclose(f);
+        }
+        vlog("gl: fps cap %d (fps_cap.txt), display sync %d (vsync.txt)\n", cap, vs);
+#ifndef USM_VPC
+        if (vs && cap && 60 % cap == 0) eglSwapInterval(0, 60 / cap), cap = 0;
+#endif
     }
     if (!cap) return;
     uint64_t now = sceKernelGetProcessTimeWide(), period = 1000000u / cap;
@@ -215,8 +276,10 @@ static void pace(void) {
 static void present_(void) {
     if (g_fb) glBindFramebuffer(GL_FRAMEBUFFER, g_fb = 0);
     dump_frame();
+    uint64_t t = sceKernelGetProcessTimeWide();
     pace();
     vglSwapBuffers(GL_FALSE);
+    g_present_us += sceKernelGetProcessTimeWide() - t;
     glDisable(GL_SCISSOR_TEST);
     glColorMask(1, 1, 1, 1), glDepthMask(1), glStencilMask(0xff);
     glClearColor(0, 0, 0, 1);
@@ -290,8 +353,28 @@ static void dxt1_decode(const uint8_t* p, uint32_t w, uint32_t h, uint8_t* out) 
 }
 static int g_texmax = -1;
 static void texmax_load(void);
+uint64_t g_tex_live;  /* bytes of texture levels held by GL (the report) */
+/* World textures (DXT1 with levels) go up as they are, one level the size cap picks: the GPU reads DXT1, no decoding on this
+   thread. shortcut: no mip chain, because vitaGL's compressed level > 0 path crashes on the Vita in sceClibMspaceRealloc (v1.2
+   dumps, gpu_alloc_compressed_texture); a chain needs our own allocation and swizzle, if far textures shimmer too much.
+   ux0:data/usm/dxt_native.txt: 1 = the cap's level, 2 = one smaller (default), 3 = two smaller, 0 = the old decoded 16-bit ones */
+static int dxt_skip(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = 2;
+        FILE* f = fopen(USM_DIR "dxt_native.txt", "r");
+        if (f) {
+            if (fscanf(f, "%d", &v) != 1 || v < 0) v = 2;
+            fclose(f);
+        }
+        if (getenv("VPC_DXT")) v = atoi(getenv("VPC_DXT"));  /* vpc tests */
+        vlog("gl: DXT1 textures %s (dxt_native.txt %d)\n", v ? "native" : "decoded", v);
+    }
+    return v;
+}
+static int dxt_mips(const Res* r) { return dxt_skip() && r->fmt == FMT_DXT1 && r->levels > 1 && !r->cube && !(r->usage & 0x601); }
 /* draw distance (ux0:data/usm/distance.txt, view-depth units; 0 = everything, no fog): static world meshes wholly
-   beyond it are not drawn (gl_draw), and fog fades in over its last 45% so the edge does not show */
+   beyond it are not drawn (gl_draw), and fog fades in over its last 25% so the edge does not show */
 static float far_dist(void) {
     static float far = -1;
     if (far < 0) {
@@ -331,15 +414,17 @@ static int upload_dxt_small(uint32_t f, const uint8_t* p, uint32_t w, uint32_t h
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ow, oh, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, o);
     return 1;
 }
-static void upload_(Res* r, const uint8_t* p) {  /* level r->base, copied when the game unlocked it */
-    uint32_t w = r->w >> r->base, h = r->h >> r->base, f = r->fmt;
+static void upload_(Res* r, uint32_t level, const uint8_t* p) {  /* a level, copied when the game unlocked it */
+    uint32_t w = r->w >> level, h = r->h >> level, f = r->fmt;
     if (!w) w = 1;
     if (!h) h = 1;
     uint32_t n = w * h;
     if (!r->gl) glGenTextures(1, &r->gl);
     glBindTexture(GL_TEXTURE_2D, r->gl);
+    memset(r->tp, 0, sizeof r->tp);  /* new storage: its sampler parameters are set again */
+    g_tex_live -= r->gl_bytes, r->gl_bytes = pitch_of(f, w) * rows_of(f, h), g_tex_live += r->gl_bytes;
     int mips = r->levels > 1;
-    if (is_dxt(f) && !(r->usage & 0x601) && r->levels > 1 && upload_dxt_small(f, p, w, h))
+    if (is_dxt(f) && !(r->usage & 0x601) && r->levels > 1 && !dxt_mips(r) && upload_dxt_small(f, p, w, h))
         mips = 0;  /* vitaGL's glGenerateMipmap garbles RGBA5551 on the Vita (rainbow noise past the first mip) */
     else if (is_dxt(f)) {
         GLenum gf = f == FMT_DXT1 ? GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
@@ -378,26 +463,33 @@ static void upload_(Res* r, const uint8_t* p) {  /* level r->base, copied when t
 }
 
 static GLenum wrap(uint32_t a) { return a == 2 || a == 5 ? GL_MIRRORED_REPEAT : a == 3 || a == 4 ? GL_CLAMP_TO_EDGE : GL_REPEAT; }
-static void bind_textures(void) {
+__attribute__((hot)) static void bind_textures(void) {
+    int unit = -1;  /* glActiveTexture only for a unit that changes; unit 0 is active again at the end */
     for (int i = 0; i < 4; i++) {
-        glActiveTexture(GL_TEXTURE0 + i);
         Res* r = st.tex[i] ? res(st.tex[i]) : NULL;
-        if (!r || r->cube || !r->uploaded) {  /* never written (render targets): transparent black adds nothing */
-            glBindTexture(GL_TEXTURE_2D, r && r->usage & 1 ? g_black : g_white);
-            continue;
-        }
-        glBindTexture(GL_TEXTURE_2D, r->gl);
+        int plain = !r || r->cube || !r->uploaded;  /* never written (render targets): transparent black adds nothing */
+        GLuint name = plain ? (r && r->usage & 1 ? g_black : g_white) : r->gl;
+#define UNIT() do { if (unit != i) glActiveTexture(GL_TEXTURE0 + i), unit = i; } while (0)
+        GC(GC_TEX + i, name, 0, 0, 0, { UNIT(); glBindTexture(GL_TEXTURE_2D, name); });
+        if (plain) continue;
         const uint32_t* s = st.ss[i];
         int lin = s[6] >= 2, mip = r->uploaded & 2 ? s[7] : 0;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, s[5] >= 2 ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                        mip == 0 ? (lin ? GL_LINEAR : GL_NEAREST)
-                        : mip == 1 ? (lin ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST)
-                                   : (lin ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR));
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap(s[1]));
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap(s[2]));
+        uint32_t tp[4] = {s[5] >= 2 ? GL_LINEAR : GL_NEAREST,
+                          mip == 0 ? (lin ? GL_LINEAR : GL_NEAREST)
+                          : mip == 1 ? (lin ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST)
+                                     : (lin ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR),
+                          wrap(s[1]), wrap(s[2])};
+        if (g_gc_off || memcmp(r->tp, tp, sizeof tp)) {  /* kept per texture: they belong to it, not to the unit */
+            UNIT();
+            memcpy(r->tp, tp, sizeof tp);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, tp[0]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, tp[1]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, tp[2]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, tp[3]);
+        }
+#undef UNIT
     }
-    glActiveTexture(GL_TEXTURE0);
+    if (unit > 0) glActiveTexture(GL_TEXTURE0);
 }
 
 /* ---- vertex input ---- */
@@ -462,6 +554,42 @@ static const Inputs* inputs_of(uint32_t vs) {
     return e;
 }
 
+/* what a vertex layout means for draw_: worked out once, as most draws repeat the last one. g_layout_gen: a new
+   declaration or vertex shader can land on a freed one's address */
+extern volatile uint32_t g_layout_gen;
+typedef struct {
+    uint32_t decl, fvf, vs0, gen;  /* as of st and g_layout_gen; vs0: st.vs */
+    uint32_t vs, want;             /* the shader really used (0: pretransformed), the locations it reads */
+    int ne, post, has_d0;
+    Elem e[32];
+    int8_t loc[32];                /* the attribute of each element, -1 none */
+} Layout;
+static void layout_make(Layout* L) {
+    L->decl = st.decl, L->fvf = st.fvf, L->vs0 = st.vs, L->gen = g_layout_gen;
+    const Elem* e = L->e;
+    int ne = L->ne = elems_of(&st, L->e);
+    /* pretransformed vertices (POSITIONT, FVF XYZRHW) skip the vertex shader even with one set (as D3D9, and DXVK's
+       UseProgrammableVS); the options menu draws its panels that way with the 2D shader still set */
+    L->post = L->has_d0 = 0;
+    for (int i = 0; i < ne; i++) L->post |= e[i].usage == 9;
+    L->vs = L->post ? 0 : st.vs;
+    const Inputs* in = L->vs ? inputs_of(L->vs) : NULL;
+    L->want = in ? in->mask : 0x7f;
+    for (int i = 0; i < ne; i++) {
+        int loc = -1;
+        if (in) {
+            for (int r = 0; r < 16; r++)
+                if (in->mask >> r & 1 && in->usage[r] == e[i].usage && in->index[r] == e[i].index) { loc = r; break; }
+        } else if (e[i].usage == 0 || e[i].usage == 9)
+            loc = FFP_POS;
+        else if (e[i].usage == 10 && e[i].index < 2)
+            loc = FFP_D0 + e[i].index, L->has_d0 |= e[i].index == 0;
+        else if (e[i].usage == 5 && e[i].index < 4)
+            loc = FFP_T0 + e[i].index;
+        L->loc[i] = e[i].type > 16 || !TYPES[e[i].type].n ? -1 : (int8_t)loc;
+    }
+}
+
 /* ---- programs ---- */
 typedef struct {
     uint32_t vs, ps, swz, sizes, flags, afunc;  /* flags: 1 pre-transformed, 2 material color */
@@ -476,8 +604,18 @@ typedef struct {
        reads, one uniform each: location and register */
     uint8_t nvc, vcr[96];
     GLint vcl[96];
+    float (*sh)[4];  /* the last values sent to its uniforms (uni), allocated at first use */
 } Prog;
 static Prog g_progs[1024];
+/* a program keeps its uniforms in GL: send them only when they changed. Slots: vertex constants by register, then: */
+enum { U_PC = 96, U_FIX = U_PC + 8, U_M, U_FLIP = U_M + 4, U_MAT, U_TF, U_AREF, U_FOG, U_FOGC, U_N };
+__attribute__((hot)) static void uni(Prog* p, int slot, GLint loc, int n, const float* v) {
+    if (!p->sh && (p->sh = malloc(U_N * 16))) memset(p->sh, 0xff, U_N * 16);
+    if (g_gc_off || !p->sh || memcmp(p->sh[slot], v, n * 16)) {
+        if (p->sh) memcpy(p->sh[slot], v, n * 16);
+        glUniform4fv(loc, n, v);
+    }
+}
 
 static GLuint compile(GLenum type, const char* src) {
     if (!src) return 0;
@@ -494,11 +632,6 @@ static GLuint compile(GLenum type, const char* src) {
         return 0;
     }
     return s;
-}
-static uint32_t fnv(const void* p, size_t n) {
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)p)[i]) * 16777619u;
-    return h;
 }
 /* Linked programs persist on the memory card (as in mk_wiita): ux0:data/usm/shadercache/<hash of both sources>.bin,
    so a shader compiles once ever instead of stalling 1-3 s every launch. A changed translator changes the source and
@@ -586,11 +719,16 @@ static int cache_load(GLuint pr, const char* path) { (void)pr, (void)path; retur
 static void cache_save(GLuint pr, const char* path) { (void)pr, (void)path; }
 #endif
 static Prog* program(const Key* k) {
-    uint32_t h = fnv(k, sizeof *k);
+    /* every draw comes here (the map alternates two programs a draw): with a pixel shader the Key is its 6 header words,
+       fp is unset. Hashing all 192 bytes one at a time was 10 ms in heavy frames */
+    size_t len = k->ps ? offsetof(Key, fp) : sizeof *k;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len / 4; i++) h = (h ^ ((const uint32_t*)k)[i]) * 16777619u;
+    h ^= h >> 16;  /* a word multiply leaves the low bits of aligned shader addresses weak, and they pick the slot */
     Prog* p = NULL;
     for (int i = 0; i < 1024; i++) {
         p = &g_progs[(h + i) & 1023];
-        if (!p->used || !memcmp(&p->k, k, sizeof *k)) break;
+        if (!p->used || !memcmp(&p->k, k, len)) break;
     }
     if (p->used) return p->prog ? p : NULL;
     p->used = 1, p->k = *k;
@@ -684,13 +822,16 @@ static GLenum sop(uint32_t o) {
     static const GLenum t[9] = {GL_KEEP, GL_KEEP, GL_ZERO, GL_REPLACE, GL_INCR, GL_DECR, GL_INVERT, GL_INCR_WRAP, GL_DECR_WRAP};
     return o < 9 ? t[o] : GL_KEEP;
 }
-static void apply_state(int rhw) {
+__attribute__((hot)) static void apply_state(int rhw) {
+    if (g_gc_state == rhw + 1 && !g_gc_off) return;  /* no state patch since this same call */
+    g_gc_state = rhw + 1;
     const uint32_t* rs = st.rs;
     GLint r[4];
     if (rhw) rect_gl(0, 0, (float)g_bw, (float)g_bh, r);
     else rect_gl((float)st.viewport[0], (float)st.viewport[1], (float)st.viewport[2], (float)st.viewport[3], r);
-    glViewport(r[0], r[1], r[2], r[3]);
-    glDepthRangef(vpf(4), vpf(5));
+    GC(GC_VIEW, r[0], r[1], r[2], r[3], glViewport(r[0], r[1], r[2], r[3]));
+    GC(GC_DEPTHR, fbits(vpf(4)), fbits(vpf(5)), 0, 0, glDepthRangef(vpf(4), vpf(5)));
+    GC_EN(GC_SCIS_EN, rs[174], GL_SCISSOR_TEST);
     if (rs[174]) {  /* scissor: RECT {left, top, right, bottom} */
         int32_t* s = (int32_t*)st.scissor;
         /* the minimap's box (a small one) is its map area: the frame, compass and edge markers drawn over its border
@@ -699,13 +840,11 @@ static void apply_state(int rhw) {
         int g = (uint32_t)(s[2] - s[0]) < g_bw / 2 && !(rs[7] && rs[23] == 8) ? 12 : 0;
         int top = g ? 0 : s[1];
         rect_gl((float)(s[0] - g), (float)top, (float)(s[2] - s[0] + 2 * g), (float)(s[3] + g - top), r);
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(r[0], r[1], r[2], r[3]);
-    } else
-        glDisable(GL_SCISSOR_TEST);
-    if (rs[7]) glEnable(GL_DEPTH_TEST), glDepthFunc(cmp(rs[23]));
-    else glDisable(GL_DEPTH_TEST);
-    glDepthMask(rs[14] ? GL_TRUE : GL_FALSE);
+        GC(GC_SCIS, r[0], r[1], r[2], r[3], glScissor(r[0], r[1], r[2], r[3]));
+    }
+    GC_EN(GC_DEPTH_EN, rs[7], GL_DEPTH_TEST);
+    if (rs[7]) GC(GC_DFUNC, rs[23], 0, 0, 0, glDepthFunc(cmp(rs[23])));
+    GC(GC_DMASK, !!rs[14], 0, 0, 0, glDepthMask(rs[14] ? GL_TRUE : GL_FALSE));
     /* D3DRS_DEPTHBIAS (195, in depth units) and SLOPESCALEDEPTHBIAS (175): decals such as wall posters sit on their
        wall this way; without it they z-fought and flashed at a distance. One D24 step is 2^-24 */
     if (rs[195] || rs[175]) {
@@ -713,33 +852,35 @@ static void apply_state(int rhw) {
         memcpy(&bias, &rs[195], 4), memcpy(&slope, &rs[175], 4);
         static int said;
         if (!said) said = 1, vlog("gl: depth bias in use (%g, slope %g)\n", bias, slope);
-        glEnable(GL_POLYGON_OFFSET_FILL), glPolygonOffset(slope, bias * 16777216.f);
+        GC_EN(GC_POLY_EN, 1, GL_POLYGON_OFFSET_FILL);
+        GC(GC_POLY, rs[175], rs[195], 0, 0, glPolygonOffset(slope, bias * 16777216.f));
     } else
-        glDisable(GL_POLYGON_OFFSET_FILL);
+        GC_EN(GC_POLY_EN, 0, GL_POLYGON_OFFSET_FILL);
     /* D3D measures winding in screen coords (y down), GL in window coords (y up); a D3D-clockwise triangle has the
        same signed area as a GL-counterclockwise one when the rows line up (texture targets, u_flip), the opposite on
        the backbuffer. Checked on vpc: the outline hulls and rooftops only come out right this way. */
-    if (rs[22] == 1) glDisable(GL_CULL_FACE);
-    else glEnable(GL_CULL_FACE), glCullFace(GL_BACK), glFrontFace((rs[22] == 3) == (g_flip > 0) ? GL_CW : GL_CCW);
+    GC_EN(GC_CULL_EN, rs[22] != 1, GL_CULL_FACE);
+    if (rs[22] != 1) {
+        GLenum ff = (rs[22] == 3) == (g_flip > 0) ? GL_CW : GL_CCW;
+        GC(GC_FRONT, ff, 0, 0, 0, (glCullFace(GL_BACK), glFrontFace(ff)));
+    }
+    GC_EN(GC_BLEND_EN, rs[27], GL_BLEND);
     if (rs[27]) {
-        glEnable(GL_BLEND);
         uint32_t s = rs[19], d = rs[20];
         if (s == 12) s = 5, d = 6;
         else if (s == 13) s = 6, d = 5;
-        glBlendFunc(blend(s), blend(d));
+        GC(GC_BFUNC, s, d, 0, 0, glBlendFunc(blend(s), blend(d)));
         static const GLenum ops[6] = {GL_FUNC_ADD, GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT, GL_MIN, GL_MAX};
-        glBlendEquation(rs[171] < 6 ? ops[rs[171]] : GL_FUNC_ADD);
-    } else
-        glDisable(GL_BLEND);
+        GC(GC_BEQ, rs[171], 0, 0, 0, glBlendEquation(rs[171] < 6 ? ops[rs[171]] : GL_FUNC_ADD));
+    }
     uint32_t cw = rs[168];
-    glColorMask(cw & 1, cw >> 1 & 1, cw >> 2 & 1, cw >> 3 & 1);
+    GC(GC_CMASK, cw & 15, 0, 0, 0, glColorMask(cw & 1, cw >> 1 & 1, cw >> 2 & 1, cw >> 3 & 1));
+    GC_EN(GC_ST_EN, rs[52], GL_STENCIL_TEST);
     if (rs[52]) {
-        glEnable(GL_STENCIL_TEST);
-        glStencilFunc(cmp(rs[56]), (GLint)rs[57], rs[58]);
-        glStencilOp(sop(rs[53]), sop(rs[54]), sop(rs[55]));
-        glStencilMask(rs[59]);
-    } else
-        glDisable(GL_STENCIL_TEST);
+        GC(GC_SFUNC, rs[56], rs[57], rs[58], 0, glStencilFunc(cmp(rs[56]), (GLint)rs[57], rs[58]));
+        GC(GC_SOP, rs[53], rs[54], rs[55], 0, glStencilOp(sop(rs[53]), sop(rs[54]), sop(rs[55])));
+        GC(GC_SMASK, rs[59], 0, 0, 0, glStencilMask(rs[59]));
+    }
 }
 
 static int count_of(uint32_t prim, uint32_t n, GLenum* mode) {
@@ -763,74 +904,84 @@ typedef struct {
     uint32_t data[16], stride[16];  /* client: offset in this command of each stream's vertices (0: none) */
 } DrawCmd;
 
-static void draw_(const DrawCmd* d) {
+uint64_t g_dt[5];  /* draw_'s sections, render thread (the report; every 8th draw, counted 8 times) */
+#define DT(i) do { if (t0) { uint64_t n_ = sceKernelGetProcessTimeWide(); g_dt[i] += 8 * (n_ - t0); t0 = n_; } } while (0)
+__attribute__((hot)) static void draw_(const DrawCmd* d) {
     GLenum mode;
     int count = count_of(d->prim, d->n, &mode);
     if (!count || !bind_target()) return;
-    Elem e[32];
-    int ne = elems_of(&st, e);
-    /* pretransformed vertices (POSITIONT, FVF XYZRHW) skip the vertex shader even with one set (as D3D9, and DXVK's
-       UseProgrammableVS); the options menu draws its panels that way with the 2D shader still set */
-    int post = 0;
-    for (int i = 0; i < ne; i++) post |= e[i].usage == 9;
-    uint32_t vs = post ? 0 : st.vs;
-    const Inputs* in = vs ? inputs_of(vs) : NULL;
+    static uint32_t dt_n;
+    uint64_t t0 = ++dt_n & 7 || !log_on() ? 0 : sceKernelGetProcessTimeWide();
+    if (g_gc_off) gc_reset();
+    static Layout L;
+    if (g_gc_off || L.decl != st.decl || L.fvf != st.fvf || L.vs0 != st.vs || L.gen != g_layout_gen) layout_make(&L);
+#ifdef USM_DEBUG
+    {   /* self-check: the kept layout is the one this draw would work out */
+        static Layout c;
+        layout_make(&c);
+        static int told;
+        if ((c.ne != L.ne || c.vs != L.vs || c.want != L.want || c.post != L.post || c.has_d0 != L.has_d0 ||
+             memcmp(c.loc, L.loc, c.ne)) && !told++)
+            vlog("gl: stale vertex layout: decl %x fvf %x vs %x\n", st.decl, st.fvf, st.vs);
+    }
+#endif
+    const Elem* e = L.e;
+    int ne = L.ne;
+    uint32_t vs = L.vs;
     Key k;
-    memset(&k, 0, sizeof k);
-    k.vs = vs, k.ps = st.ps;
-    uint32_t arrays = 0, has_d0 = 0;
+    memset(&k, 0, offsetof(Key, fp));  /* fp only counts without a pixel shader, below */
+    k.vs = vs, k.ps = st.ps, k.flags = L.post;
+    uint32_t arrays = 0;
     for (int i = 0; i < ne; i++) {
-        int loc = -1;
-        if (in) {
-            for (int r = 0; r < 16; r++)
-                if (in->mask >> r & 1 && in->usage[r] == e[i].usage && in->index[r] == e[i].index) { loc = r; break; }
-        } else if (e[i].usage == 0 || e[i].usage == 9) {
-            loc = FFP_POS;
-            if (e[i].usage == 9) k.flags |= 1;
-        } else if (e[i].usage == 10 && e[i].index < 2)
-            loc = FFP_D0 + e[i].index, has_d0 |= e[i].index == 0;
-        else if (e[i].usage == 5 && e[i].index < 4)
-            loc = FFP_T0 + e[i].index;
-        if (loc < 0 || arrays >> loc & 1 || e[i].type > 16 || !TYPES[e[i].type].n) continue;
+        int loc = L.loc[i];
+        if (loc < 0 || arrays >> loc & 1) continue;
         const uint8_t* p;
-        uint32_t stride, sn = e[i].stream & 15;
+        uint32_t stride, sn = e[i].stream & 15, buf = 0;
         if (d->client) {
             if (!d->data[sn]) continue;
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
             p = (const uint8_t*)d + d->data[sn], stride = d->stride[sn];
         } else {
             Res* vb = st.vb[sn] ? res(st.vb[sn]) : NULL;
             if (!vb || !vb->gl) continue;
-            glBindBuffer(GL_ARRAY_BUFFER, vb->gl);
+            buf = vb->gl;
             stride = st.vbstride[sn], p = (const uint8_t*)(uintptr_t)(st.vboff[sn] + d->base * stride);
         }
         p += e[i].off;
-        glEnableVertexAttribArray(loc);
-        glVertexAttribPointer(loc, TYPES[e[i].type].n, TYPES[e[i].type].gl, TYPES[e[i].type].norm, stride, p);
+        if (!(g_arrays >> loc & 1)) glEnableVertexAttribArray(loc);
+        uint32_t* ga = g_gc[GC_ATTR + loc];
+        /* a client array's vertices are new every draw */
+        if (d->client || !ga[4] || ga[0] != buf || ga[1] != (uint32_t)(uintptr_t)p || ga[2] != stride || ga[3] != e[i].type) {
+            GC(GC_VB, buf, 0, 0, 0, glBindBuffer(GL_ARRAY_BUFFER, buf));
+            glVertexAttribPointer(loc, TYPES[e[i].type].n, TYPES[e[i].type].gl, TYPES[e[i].type].norm, stride, p);
+            ga[0] = buf, ga[1] = (uint32_t)(uintptr_t)p, ga[2] = stride, ga[3] = e[i].type, ga[4] = !d->client;
+        }
         arrays |= 1u << loc;
         if (e[i].type == 4) k.swz |= 1u << loc;
         k.sizes |= (4u - TYPES[e[i].type].n) << 2 * loc;
     }
-    for (int l = 0; l < 16; l++)
-        if (g_arrays >> l & 1 && !(arrays >> l & 1)) glDisableVertexAttribArray(l);
+    if (g_arrays & ~arrays)
+        for (int l = 0; l < 16; l++)
+            if (g_arrays >> l & 1 && !(arrays >> l & 1)) glDisableVertexAttribArray(l);
     g_arrays = arrays;
-    uint32_t want = in ? in->mask : 0x7f;
-    for (int l = 0; l < 16; l++)
-        if (want >> l & 1 && !(arrays >> l & 1)) {
-            float v = !in && l == FFP_D0 ? 1.f : 0.f;
-            glVertexAttrib4f(l, v, v, v, !in && l == FFP_D1 ? 0.f : 1.f);
+    uint32_t miss = L.want & ~arrays;
+    for (int l = 0; miss >> l; l++)
+        if (miss >> l & 1) {
+            float v = !vs && l == FFP_D0 ? 1.f : 0.f, a = !vs && l == FFP_D1 ? 0.f : 1.f;
+            GC(GC_CONST + l, fbits(v), fbits(a), 0, 0, glVertexAttrib4f(l, v, v, v, a));
         }
     int rhw = k.flags & 1;
-    if (!in && !rhw && st.rs[137] && !has_d0) k.flags |= 2;
+    if (!vs && !rhw && st.rs[137] && !L.has_d0) k.flags |= 2;
     if (st.rs[15]) k.afunc = st.rs[25] ? st.rs[25] : 8;
     if (k.afunc == 8) k.afunc = 0;
-    if (!st.ps) ffp_pixel(&k.fp);
+    if (!st.ps) memset(&k.fp, 0, sizeof k.fp), ffp_pixel(&k.fp);
 #ifdef USM_DEBUG
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("VPC_DBG") ? atoi(getenv("VPC_DBG")) : 0;
     if (dbg >= 1 && dbg <= 4 && !to_backbuffer() && !rhw && d->n > 4) k.flags |= dbg << 3;  /* debug: 3D draws into targets */
 #endif
+    DT(0);
     Prog* p = program(&k);
+    DT(1);
     /* the purple HUD messages ("NEW CITY GOALS!") never show on the Vita: they seem to go through small texture targets
        (387x143 ones appear and go around them). The first draw that samples each such target, for the log */
     if (log_on() && st.tex[0]) {
@@ -898,48 +1049,56 @@ static void draw_(const DrawCmd* d) {
     if (skip < 0) skip = getenv("VPC_SKIP") ? atoi(getenv("VPC_SKIP")) : 0;
     if (p->id == skip) return;  /* debug: leave one program's draws out */
 #endif
-    glUseProgram(p->prog);
+    GC(GC_PROG, p->prog, 0, 0, 0, glUseProgram(p->prog));
     float v4[4];
-    if (p->vc >= 0) glUniform4fv(p->vc, 96, (const float*)st.vsc);
-    for (int i = 0; i < p->nvc; i++) glUniform4fv(p->vcl[i], 1, (const float*)st.vsc[p->vcr[i]]);
-    if (p->pc >= 0) glUniform4fv(p->pc, 8, (const float*)st.psc);
+    if (p->vc >= 0) uni(p, 0, p->vc, 96, (const float*)st.vsc);
+    for (int i = 0; i < p->nvc; i++) uni(p, p->vcr[i], p->vcl[i], 1, (const float*)st.vsc[p->vcr[i]]);
+    if (p->pc >= 0) uni(p, U_PC, p->pc, 8, (const float*)st.psc);
     if (p->fix >= 0) {
         float vw = rhw ? (float)g_bw : (float)st.viewport[2], vh = rhw ? (float)g_bh : (float)st.viewport[3];
         v4[0] = 1.f / vw, v4[1] = -1.f / vh, v4[2] = 2.f / g_bw, v4[3] = 2.f / g_bh;
-        glUniform4fv(p->fix, 1, v4);
+        uni(p, U_FIX, p->fix, 1, v4);
     }
     if (p->m >= 0) {
         float wv[16], wvp[16];
         mat4(st.transform[256], st.transform[2], wv);
         mat4(wv, st.transform[3], wvp);
-        glUniform4fv(p->m, 4, wvp);
+        uni(p, U_M, p->m, 4, wvp);
     }
-    if (p->flip >= 0) v4[0] = g_flip, v4[1] = v4[2] = v4[3] = 0, glUniform4fv(p->flip, 1, v4);
-    if (p->mat >= 0) glUniform4fv(p->mat, 1, (const float*)st.material);
-    if (p->tf >= 0) rgba(st.rs[60], v4), glUniform4fv(p->tf, 1, v4);
-    if (p->aref >= 0) v4[0] = (float)(st.rs[24] & 255), v4[1] = v4[2] = v4[3] = 0, glUniform4fv(p->aref, 1, v4);
+    if (p->flip >= 0) v4[0] = g_flip, v4[1] = v4[2] = v4[3] = 0, uni(p, U_FLIP, p->flip, 1, v4);
+    if (p->mat >= 0) uni(p, U_MAT, p->mat, 1, (const float*)st.material);
+    if (p->tf >= 0) rgba(st.rs[60], v4), uni(p, U_TF, p->tf, 1, v4);
+    if (p->aref >= 0) v4[0] = (float)(st.rs[24] & 255), v4[1] = v4[2] = v4[3] = 0, uni(p, U_AREF, p->aref, 1, v4);
     if (p->fog >= 0) {  /* the 3D world view only; to the game's own fog color (D3DRS_FOGCOLOR, the sky's light blue in
                            free roam; a fixed blue-grey looked like grey slabs), black for an additive pass */
         float far = far_dist();
-        v4[0] = far * 0.55f, v4[1] = far > 0 ? 1.f / (far * 0.45f) : 0, v4[2] = !rhw && far > 0 && !d->nofog && !st.rs[52] && main_scene(&st), v4[3] = 0;
-        glUniform4fv(p->fog, 1, v4);
+        v4[0] = far * 0.75f, v4[1] = far > 0 ? 1.f / (far * 0.25f) : 0, v4[2] = !rhw && far > 0 && !d->nofog && !st.rs[52] && main_scene(&st), v4[3] = 0;
+        uni(p, U_FOG, p->fog, 1, v4);
         int add = st.rs[27] && st.rs[20] == 2;
         if (st.rs[34]) rgba(st.rs[34], v4);
         else v4[0] = 0.42f, v4[1] = 0.47f, v4[2] = 0.54f;
         if (add) v4[0] = v4[1] = v4[2] = 0;
-        glUniform4fv(p->fogc, 1, v4);
+        uni(p, U_FOGC, p->fogc, 1, v4);
     }
+    DT(2);
     bind_textures();
-    if (d->icon) glBindTexture(GL_TEXTURE_2D, g_glyphs);  /* unit 0 is active after bind_textures */
+    DT(3);
+    if (d->icon) {  /* unit 0 is active after bind_textures */
+        glBindTexture(GL_TEXTURE_2D, g_glyphs);
+        g_gc[GC_TEX][4] = 0;
+    }
     apply_state(rhw);
+    if (k.flags >> 3) gc_reset();  /* debug modes: raw state below */
     if (k.flags >> 3 == 1) glDisable(GL_DEPTH_TEST), glDisable(GL_BLEND), glDisable(GL_STENCIL_TEST), glColorMask(1, 1, 1, 1);
     else if (k.flags >> 3) glDisable(GL_BLEND), glColorMask(1, 1, 1, 1);
     static uint32_t timed;  /* the report's vitaGL time: every 8th draw is timed (a clock read costs) */
+    DT(4);
     uint64_t t = ++timed & 7 ? 0 : sceKernelGetProcessTimeWide();
     if (d->idx >= 0) {
         const void* ip = (const void*)(uintptr_t)d->idx;
-        if (d->client) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0), ip = (const uint8_t*)d + d->idx;
-        else glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, res(st.ib)->gl);
+        uint32_t ib = d->client ? 0 : res(st.ib)->gl;
+        if (d->client) ip = (const uint8_t*)d + d->idx;
+        GC(GC_IB, ib, 0, 0, 0, glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib));
         glDrawElements(mode, count, d->idx32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, ip);
     } else
         glDrawArrays(mode, 0, count);
@@ -951,7 +1110,9 @@ static void free_(Res* r) {
     if (r->fbo) glDeleteFramebuffers(1, &r->fbo);
     if (r->rb) glDeleteRenderbuffers(1, &r->rb);  /* comic cutscenes make a new target nearly every frame */
     if (r->gl) r->size ? glDeleteBuffers(1, &r->gl) : glDeleteTextures(1, &r->gl);
+    g_tex_live -= r->gl_bytes, r->gl_bytes = 0;
     r->fbo = r->rb = r->gl = r->uploaded = 0;
+    memset(r->tp, 0, sizeof r->tp);
 }
 
 /* ---- the game thread: recording ----
@@ -985,7 +1146,7 @@ static uint64_t now_us(void) { return sceKernelGetProcessTimeWide(); }
 static volatile int g_rcmd = -1;                  /* command the render thread is running, -1 idle */
 static volatile uint32_t g_jobs, g_presents, g_in_flush;
 
-static void run(Arena* a) {
+__attribute__((hot)) static void run(Arena* a) {
     for (uint32_t o = 0; o < a->n;) {
         CmdHead* h = (CmdHead*)(a->p + o);
         uint8_t* q = (uint8_t*)(h + 1);
@@ -993,7 +1154,7 @@ static void run(Arena* a) {
         g_rcmd = (int)h->type;
         switch (h->type) {
         case C_INIT: init_(((uint32_t*)q)[0], ((uint32_t*)q)[1]); break;
-        case C_PATCH: memcpy((uint8_t*)&g_rst + ((uint32_t*)q)[0], q + 8, ((uint32_t*)q)[1]); break;
+        case C_PATCH: memcpy((uint8_t*)&g_rst + ((uint32_t*)q)[0], q + 8, ((uint32_t*)q)[1]), g_gc_state = 0; break;
         case C_CLEAR: {
             uint32_t* c = (uint32_t*)q;
             float z;
@@ -1001,12 +1162,13 @@ static void run(Arena* a) {
             clear_(c[0], c[5] ? (const int32_t*)(c + 6) : NULL, c[1], c[2], z, c[4]);
             break;
         }
-        case C_UPLOAD: upload_(*(Res**)q, q + 8); break;
+        case C_UPLOAD: upload_(*(Res**)q, ((uint32_t*)q)[1], q + 8); break;
         case C_BUFFER: buffer_(*(Res**)q, ((uint32_t*)q)[1], q + 8); break;
         case C_DRAW: draw_((const DrawCmd*)q); break;
         case C_FREE: free_(*(Res**)q); break;
         case C_PRESENT: present_(); break;
         }
+        if (h->type != C_DRAW && h->type != C_PATCH) gc_reset();  /* those used raw GL */
     }
     g_rcmd = -1;
 }
@@ -1062,7 +1224,7 @@ static void* push(uint32_t type, uint32_t size) {
         uint32_t cap = a->cap ? a->cap : 1u << 20;
         while (cap < need) cap *= 2;
         uint8_t* p = realloc(a->p, cap);
-        if (!p) { vlog("gl: out of memory for commands (%u bytes)\n", cap); abort(); }
+        if (!p) { void vcrash(const char*, ...); vcrash("gl: out of memory for commands (%u bytes)\n", cap); abort(); }
         g_cmd_bytes += cap - a->cap, a->p = p, a->cap = cap;
     }
     CmdHead* h = (CmdHead*)(a->p + a->n);
@@ -1072,8 +1234,10 @@ static void* push(uint32_t type, uint32_t size) {
     return h + 1;
 }
 
-/* send the parts of the game's state the renderer reads that changed: only the 64-byte chunks the D3D setters marked
-   (g_st_dirty) are compared, and a run of changed chunks becomes one patch */
+/* send the parts of the game's state the renderer reads that changed. The D3D setters mark 64-byte chunks (g_st_dirty):
+   only those are visited, through the bitmap, compared 16 bytes at a time (a matrix straddles two chunks, a render state
+   is one word), and a run of changed slices becomes one patch. Walking every chunk of every range was 8 us a draw, the
+   worker's biggest single cost. A chunk at a range's edge may carry neighbours along: harmless, g_rst is just a copy */
 static void send_patch(uint32_t a, uint32_t b) {
     const uint8_t* m = (const uint8_t*)g_main;
     uint32_t* q = push(C_PATCH, 8 + b - a);
@@ -1092,26 +1256,40 @@ static void patch_state(void) {
         {offsetof(D3DState, transform[2]), 2 * sizeof g_sent.transform[0]},
         {offsetof(D3DState, transform[256]), sizeof g_sent.transform[0]},
     };
-    const uint8_t *m = (const uint8_t*)g_main, *s0 = (const uint8_t*)&g_sent;
+    enum { NW = sizeof g_st_dirty / sizeof *g_st_dirty };
+    static uint32_t want[NW];  /* the chunks of R */
+    static int ready;
+    if (!ready) {
+        ready = 1;
+        for (unsigned i = 0; i < sizeof R / sizeof *R; i++)
+            for (uint32_t c = R[i].off / 64; c * 64 < R[i].off + R[i].len; c++) want[c >> 5] |= 1u << (c & 31);
+    }
+    const uint32_t* m = (const uint32_t*)g_main;
+    const uint32_t* s0 = (const uint32_t*)&g_sent;
     uint32_t ra = 0, rb = 0;  /* the open run [ra, rb), empty when equal */
-    for (unsigned i = 0; i < sizeof R / sizeof *R; i++)
-        for (uint32_t c = R[i].off / 64, end = R[i].off + R[i].len; c * 64 < end; c++) {
-            if (!(g_st_dirty[c >> 5] >> (c & 31) & 1)) continue;
-            uint32_t a = c * 64 > R[i].off ? c * 64 : R[i].off, b = c * 64 + 64 < end ? c * 64 + 64 : end;
-            if (!memcmp(m + a, s0 + a, b - a)) continue;
-            if (ra < rb && a == rb) rb = b;
-            else {
-                if (ra < rb) send_patch(ra, rb);
-                ra = a, rb = b;
+    for (uint32_t w = 0; w < NW; w++) {
+        uint32_t bits = g_st_dirty[w] & want[w];
+        g_st_dirty[w] = 0;
+        for (; bits; bits &= bits - 1) {
+            uint32_t o = (w * 32 + (uint32_t)__builtin_ctz(bits)) * 16;  /* in words */
+            for (uint32_t e = o + 16; o < e; o += 4) {
+                const uint32_t *x = m + o, *y = s0 + o;
+                if (x[0] == y[0] && x[1] == y[1] && x[2] == y[2] && x[3] == y[3]) continue;
+                if (ra < rb && o * 4 == rb) rb += 16;
+                else {
+                    if (ra < rb) send_patch(ra, rb);
+                    ra = o * 4, rb = ra + 16;
+                }
             }
         }
+    }
     if (ra < rb) send_patch(ra, rb);
-    memset(g_st_dirty, 0, sizeof g_st_dirty);
 #ifdef USM_VPC
+    const uint8_t *m8 = (const uint8_t*)g_main, *s8 = (const uint8_t*)&g_sent;
     /* self-check: a write the setters did not mark leaves g_sent behind; name it once, and send it anyway */
     for (unsigned i = 0; i < sizeof R / sizeof *R; i++)
         for (uint32_t o = R[i].off, end = o + R[i].len; o < end; o += 4)
-            if (memcmp(m + o, s0 + o, 4)) {
+            if (memcmp(m8 + o, s8 + o, 4)) {
                 static int told;
                 if (!told++) vlog("gl: state at offset %u changed without being marked dirty\n", o);
                 send_patch(o, o + 4);
@@ -1134,10 +1312,46 @@ void gl_init(uint32_t bw, uint32_t bh) {
     uint32_t* q = push(C_INIT, 8);
     q[0] = bw, q[1] = bh;
 }
+/* The log, for frame spikes (an explosion took 1,000 draws to 3,500): what drew them, by target, view size and shaders */
+static struct { uint32_t rt, w, h, vs, ps, draws, tris; } g_sp[64];
+static uint32_t g_spn, g_sp_total;
+static void spike_note(const D3DState* m, uint32_t n) {
+    uint32_t i, rt = m->rt[0];
+    g_sp_total++;
+    for (i = 0; i < g_spn; i++)
+        if (g_sp[i].rt == rt && g_sp[i].vs == m->vs && g_sp[i].ps == m->ps && g_sp[i].w == m->viewport[2] && g_sp[i].h == m->viewport[3]) break;
+    if (i == g_spn) {
+        if (g_spn == 64) return;
+        g_spn++, g_sp[i].rt = rt, g_sp[i].vs = m->vs, g_sp[i].ps = m->ps, g_sp[i].w = m->viewport[2], g_sp[i].h = m->viewport[3];
+        g_sp[i].draws = g_sp[i].tris = 0;
+    }
+    g_sp[i].draws++, g_sp[i].tris += n;
+}
+static void spike_check(void) {
+    static float avg;
+    static uint32_t quiet;
+    if (quiet) quiet--;
+    if (g_sp_total > 1500 && g_sp_total > avg * 1.8f && avg > 0 && !quiet) {
+        quiet = 60;
+        vlog("spike: %u draws (usual %.0f), by target:\n", g_sp_total, avg);
+        for (int k = 0; k < 6; k++) {
+            uint32_t b = ~0u, most = 0;
+            for (uint32_t i = 0; i < g_spn; i++)
+                if (g_sp[i].draws > most) most = g_sp[i].draws, b = i;
+            if (b == ~0u) break;
+            vlog("  %u draws %u tris: target %x %ux%u vs %x ps %x\n", g_sp[b].draws, g_sp[b].tris, g_sp[b].rt, g_sp[b].w, g_sp[b].h, g_sp[b].vs, g_sp[b].ps);
+            g_sp[b].draws = 0;
+        }
+    }
+    avg = avg ? avg * 0.9f + g_sp_total * 0.1f : g_sp_total;
+    g_spn = g_sp_total = 0;
+}
 void gl_present(void) {
     g_rl_frame++;
+    if (log_on()) spike_check();
     int was = g_world_fog;
-    g_world_fog = g_main->rs[28] && g_world_draws >= 24;  /* the map (game fog off) and panel cutscenes get none */
+    g_map_load = g_map_seen, g_map_seen = 0;
+    g_world_fog = g_main->rs[28] && g_world_draws >= 24 && !g_cutscene;  /* the map (game fog off) and cutscenes get none */
     if (g_world_fog && !was) g_world_back++;  /* the early cull forgets what it skipped before (gl_rl_before) */
     g_world_draws = 0;
     push(C_PRESENT, 0);
@@ -1172,6 +1386,8 @@ static uint32_t base_of(const Res* r) {
     if (!g_texmax || r->cube || r->usage & 0x601 || r->levels <= 1) return 0;
     uint32_t b = 0;
     while (b + 1 < r->levels && b < 15 && ((r->w >> b) > (uint32_t)g_texmax || (r->h >> b) > (uint32_t)g_texmax)) b++;
+    if (dxt_mips(r))
+        for (int i = 1; i < dxt_skip() && b + 1 < r->levels && (r->w >> (b + 1)) >= 8 && (r->h >> (b + 1)) >= 8; i++) b++;
     return b;
 }
 static void upload_level(Res* r, uint32_t b) {
@@ -1180,14 +1396,14 @@ static void upload_level(Res* r, uint32_t b) {
     uint32_t n = pitch_of(r->fmt, w ? w : 1) * rows_of(r->fmt, h ? h : 1);
     r->base = b;
     Res** q = push(C_UPLOAD, 8 + n);
-    q[0] = r;
+    q[0] = r, ((uint32_t*)q)[1] = b;
     memcpy((uint8_t*)q + 8, r->bits[b], n);
     r->sent = 1;
     g_uploads++, g_upload_us += now_us() - t;
 }
 void gl_upload(Res* r, uint32_t level) {
-    if (r->cube || level >= 16 || !r->bits[level] || level != base_of(r)) return;
-    upload_level(r, level);
+    if (r->cube || level >= 16 || !r->bits[level]) return;
+    if (level == base_of(r)) upload_level(r, level);
 }
 void gl_free(Res* r) { *(Res**)push(C_FREE, 8) = r; }
 uint32_t gl_mem_free_mb(int ram) { return g_render ? (uint32_t)(vglMemFree(ram ? VGL_MEM_RAM : VGL_MEM_VRAM) >> 20) : 0; }
@@ -1214,15 +1430,35 @@ static int vs_wrow(uint32_t vs) {
     return -1;
 }
 typedef struct { const void* vb; uint32_t at, idx, count, gen; float c[3], r; } Sphere;  /* gen: vb + ib content versions */
-static Sphere g_sph[8192];
+static Sphere g_sph[16384];
+/* the pause map zoomed out draws the city as unit boxes, one draw each, alternating two programs: up to 9,000 draws a frame,
+   which showed huge garbage triangles at 4 fps on the Vita. Meshes outside the view are always left out; past 2,500 draws
+   offered (g_map_load) so are those smaller than map_lod.txt pixels on screen. 0 = off. Cutscenes draw the same far
+   boxes (fog is off): every spike in a 2 min log, up to 4,000 draws, 2,600 of them for 17k triangles, so sooner and 1.5x */
+static float map_px(void) {
+    static float px = -1;
+    if (px < 0) {
+        px = 4;
+        FILE* f = fopen(USM_DIR "map_lod.txt", "r");
+        if (f) {
+            if (fscanf(f, "%f", &px) != 1 || px < 0) px = 4;
+            fclose(f);
+        }
+        if (getenv("VPC_MAP_LOD")) px = (float)atof(getenv("VPC_MAP_LOD"));  /* vpc tests */
+        vlog("gl: map detail %.1f px (map_lod.txt; 0 = off)\n", px);
+    }
+    return px;
+}
+static int map_view(const D3DState* m) { return !g_world_fog && (!m->rs[28] || g_cutscene) && main_view(m) && map_px() > 0; }
 /* 1: wholly beyond the draw distance; 2: the camera is inside it and it reaches past the distance (the sky dome: no fog) */
 static int too_far(const D3DState* m, const Elem* e, int ne, Res* ib, const void* idx, int idx32, int count, int32_t base) {
     float far = far_dist();
+    int map = map_view(m);
     /* draws without depth writes are never left out: the sky's pieces lie past any distance, and culling them left
        holes showing the dark clear color (the grey slabs over the skyline) */
-    if (far <= 0 || !m->vs || !idx || !ib || !main_scene(m) || !m->rs[14]) return 0;
+    if (!m->vs || !idx || !ib || (!map && (far <= 0 || !main_scene(m) || !m->rs[14]))) return 0;
     int row = vs_wrow(m->vs), pe = -1;
-    if (row < 0 || row > 252) return 0;
+    if (row < (map ? 3 : 0) || row > 252) return 0;
     for (int i = 0; i < ne; i++)
         if (e[i].usage == 0 && e[i].index == 0 && e[i].type == 2) pe = i;  /* float3 position */
     if (pe < 0) return 0;
@@ -1233,7 +1469,7 @@ static int too_far(const D3DState* m, const Elem* e, int ne, Res* ib, const void
     uint32_t gen = vb->gen * 31u + ib->gen;  /* a reloaded city chunk reuses buffers: a stale sphere hid buildings */
     uint32_t h = ((uintptr_t)vb >> 4) * 2654435761u ^ at * 40503u ^ io * 9973u ^ (uint32_t)count;
     /* 4-way sets: direct-mapped, two meshes on one slot pushed each other out every frame and walked all their indices */
-    Sphere *set = &g_sph[(h & 2047) * 4], *sp = NULL;
+    Sphere *set = &g_sph[(h & 4095) * 4], *sp = NULL;
     for (int w = 0; w < 4 && !sp; w++)
         if (set[w].vb == vb && set[w].at == at && set[w].idx == io && set[w].count == (uint32_t)count && set[w].gen == gen) sp = &set[w];
     if (!sp) {
@@ -1254,6 +1490,19 @@ static int too_far(const D3DState* m, const Elem* e, int ne, Res* ib, const void
     float w[4];
     memcpy(w, m->vsc[row], 16);
     float d = w[0] * sp->c[0] + w[1] * sp->c[1] + w[2] * sp->c[2] + w[3], r = sp->r * sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    if (map) {
+        g_map_seen++;
+        float x[4], y[4], thr = g_cutscene ? 1200 : 2500, load = (float)g_map_load / thr;
+        float px = load < 1 ? 0 : map_px() * (g_cutscene ? 1.5f : 1) * (load < 4 ? load : 4);  /* the more boxes, the coarser */
+        memcpy(x, m->vsc[row - 3], 16), memcpy(y, m->vsc[row - 2], 16);
+        float cx = x[0] * sp->c[0] + x[1] * sp->c[1] + x[2] * sp->c[2] + x[3], rx = sp->r * sqrtf(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+        float cy = y[0] * sp->c[0] + y[1] * sp->c[1] + y[2] * sp->c[2] + y[3], ry = sp->r * sqrtf(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+        static uint32_t bad;  /* garbage matrices at record time separate a CPU side fault from a GPU side one (the map's coloured shards) */
+        if ((!(fabsf(cx) < 1e8f) || !(fabsf(cy) < 1e8f) || !(fabsf(d) < 1e8f)) && !(bad++ & 255))
+            vlog("map: bad matrix %u: x %g %g %g %g w %g %g %g %g\n", bad, x[0], x[1], x[2], x[3], w[0], w[1], w[2], w[3]);
+        if (d + r <= 0 || fabsf(cx) - rx > d + r || fabsf(cy) - ry > d + r) return 1;
+        return d > r && rx / d * m->viewport[2] < 2 * px && ry / d * m->viewport[3] < 2 * px;
+    }
     if (d - r > far * 1.25f) g_deep_n++;  /* early cull: far enough that a few frames' late recheck can't show */
     return d - r > far ? 1 : d - r < 0 && r > far ? 2 : 0;
 }
@@ -1288,11 +1537,10 @@ static Skip* skip_slot(uint32_t entry, uint32_t fn, uint32_t* w) {
 int gl_rl_before(uint32_t entry, uint32_t fn, uint32_t* mark) {
     *mark = 0;
     if (!early_on() || far_dist() <= 0 || !main_scene(g_main)) return 0;
-    /* a mission's end reloads the city: entries keyed by stale instance/mesh words would hide new buildings */
-    extern uint32_t g_static_writes;  /* d3d9_null.c: static buffers rewritten = something (re)loaded */
-    static uint32_t back, writes;
-    if (back != g_world_back || writes != g_static_writes)
-        back = g_world_back, writes = g_static_writes, memset(g_skip, 0, sizeof g_skip);
+    /* Not on every static buffer write: streaming writes nearly every frame, which kept this table empty (44 skips in a
+       2 min log). A stale entry can't hide anything for long: hits don't renew it, it expires after 4 frames */
+    static uint32_t back;
+    if (back != g_world_back) back = g_world_back, memset(g_skip, 0, sizeof g_skip);
     uint32_t w[3];
     Skip* k = skip_slot(entry, fn, w);
     int hit = k->fn == fn && !memcmp(k->w, w, 12) && g_rl_frame - k->frame < 4;
@@ -1347,6 +1595,8 @@ static int icon_quad(const Elem* e, int ne, uint8_t* q, const DrawCmd* d, uint32
     return 1;
 }
 
+uint64_t g_rt[4];  /* gl_draw's sections, the report; every 8th draw, counted 8 times */
+#define RT(i) do { if (t0) { uint64_t n_ = now_us(); g_rt[i] += 8 * (n_ - t0); t0 = n_; } } while (0)
 void gl_draw(uint32_t prim, uint32_t n, const uint8_t* up, uint32_t up_stride, const void* idx, int idx32, int32_t base,
              uint32_t minv, uint32_t numv) {
     GLenum mode;
@@ -1354,18 +1604,24 @@ void gl_draw(uint32_t prim, uint32_t n, const uint8_t* up, uint32_t up_stride, c
     if (!count) return;
     /* "record" in the report: every 8th draw is timed and counts 8 times (two clock syscalls per draw cost the worker) */
     static uint32_t timed;
-    uint64_t t = ++timed & 7 ? 0 : now_us();
+    uint64_t t = ++timed & 7 ? 0 : now_us(), t0 = t;
     patch_state();
+    RT(0);
+    if (log_on()) spike_note(g_main, n);
     /* 3D comic panels draw their world in the full view too, clipped by stencil masks or a panel scissor: not world */
     const int32_t* sc = (const int32_t*)g_main->scissor;
     if (g_main->rs[28] && g_main->rs[14] && g_main->vs && !g_main->rs[52] && main_view(g_main) &&
         (!g_main->rs[174] || (sc[0] <= 0 && sc[1] <= 0 && sc[2] >= (int32_t)g_main->viewport[2] && sc[3] >= (int32_t)g_main->viewport[3])))
         g_world_draws++;
-    Elem e[32];
-    int ne = elems_of(g_main, e);
-    uint32_t used = 0;
-    for (int i = 0; i < ne; i++) used |= 1u << (e[i].stream & 15);
+    static struct { uint32_t decl, fvf, gen, used; int ne; Elem e[32]; } lay;  /* recording: one thread at a time */
     const D3DState* m = g_main;
+    if (g_gc_off || lay.decl != m->decl || lay.fvf != m->fvf || lay.gen != g_layout_gen) {
+        lay.decl = m->decl, lay.fvf = m->fvf, lay.gen = g_layout_gen, lay.used = 0, lay.ne = elems_of(m, lay.e);
+        for (int i = 0; i < lay.ne; i++) lay.used |= 1u << (lay.e[i].stream & 15);
+    }
+    const Elem* e = lay.e;
+    int ne = lay.ne;
+    uint32_t used = lay.used;
     Res* ib = idx && !up && m->ib ? res(m->ib) : NULL;
     uint32_t isz = idx32 ? 4 : 2;
     int gpu = !up && (!idx || (is_static(ib) && (const uint8_t*)idx >= (uint8_t*)ib->bits[0] &&
@@ -1373,11 +1629,13 @@ void gl_draw(uint32_t prim, uint32_t n, const uint8_t* up, uint32_t up_stride, c
     for (uint32_t s = 0; s < 16; s++)
         if (used >> s & 1 && !is_static(m->vb[s] ? res(m->vb[s]) : NULL)) gpu = 0;
     int far = gpu ? too_far(m, e, ne, ib, idx, idx32, count, base) : 0;
+    RT(1);
     if (far == 1) {
         g_culled++, g_far_n++;
         if (t) g_draw_us += 8 * (now_us() - t);
         return;
     }
+    { extern uint32_t g_tris; g_tris += n; }
     if (gpu) {
         for (uint32_t s = 0; s < 16; s++)
             if (used >> s & 1) send_buffer(res(m->vb[s]), GL_ARRAY_BUFFER);
@@ -1446,6 +1704,7 @@ void gl_draw(uint32_t prim, uint32_t n, const uint8_t* up, uint32_t up_stride, c
         d->icon = icon_quad(e, ne, q, d, nv);
         g_client_draws++;
     }
+    RT(2);
     /* a managed texture drawn with is on the GPU: our copy only doubles its memory */
     for (int i = 0; i < 4; i++) {
         Res* r = m->tex[i] ? res(m->tex[i]) : NULL;
@@ -1453,6 +1712,7 @@ void gl_draw(uint32_t prim, uint32_t n, const uint8_t* up, uint32_t up_stride, c
             upload_level(r, 0);
         if (r && r->sent && !r->dropped && !r->cube && r->pool == 1 && !(r->usage & 0x201)) res_drop_bits(r);
     }
+    RT(3);
     g_draws++, g_drawn_n++;
     if (t) g_draw_us += 8 * (now_us() - t);
 }

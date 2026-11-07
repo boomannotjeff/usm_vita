@@ -36,7 +36,7 @@ static void free_levels(Res* r) {
 /* A managed texture the game loaded and drew with: vitaGL holds it now, so our copy only doubles its memory.
    shortcut: a later partial lock sees garbage outside what it writes; the log says if the game ever locks again */
 void res_drop_bits(Res* r) { free_levels(r), r->dropped = 1; }
-uint32_t g_static_writes;  /* write Locks of static vertex/index buffers (loading), for gl.c's early cull */
+volatile uint32_t g_layout_gen = 1;  /* gl.c: declarations and vertex shaders created, its layout cache */
 /* ---- lifetime: a texture or buffer is freed when its count reaches 0. As in D3D9, the device's Set* hold a
    reference and Get* hand one out, so nothing still bound is freed under the renderer. The object itself stays
    (16 bytes), so a stale pointer reads an empty resource instead of freed memory ---- */
@@ -60,6 +60,8 @@ static uint32_t unref(uint32_t o) {
     return n;
 }
 static void res_Release(Ctx* c) { c->eax = unref(ARG(0)); }
+/* native.c: a Release that waited for the worker runs at its next fence instead */
+void d3d_release_later(uint32_t o) { unref(o); }
 /* a device slot taking a new resource: the new one gains a reference, the old one loses its */
 static void rebind(uint32_t* slot, uint32_t o) {
     if (*slot == o) return;
@@ -124,17 +126,23 @@ static const ShimDef cube_impl[] = {{"LockRect", cube_LockRect}, {"UnlockRect", 
                                     {NULL, NULL}};
 
 /* ---- vertex and index buffers: Lock(offset, size, ppData, flags) ---- */
+static int is_ring(uint32_t obj);
 static void buf_Lock(Ctx* c) {
     Res* r = res(ARG(0));
     if (!r->bits[0]) r->bits[0] = guest_alloc(r->size ? r->size : 16), g_vbuf_bytes += r->size;
     static uint32_t gen;
     if (!(ARG(4) & 0x10)) {  /* not D3DLOCK_READONLY: gl.c sends it again; its spheres go stale */
         r->sent = 0, r->gen = ++gen;
-        if (!(r->usage & 0x200)) g_static_writes++;  /* loading: gl.c's early cull forgets its skips */
     }
     ST32(ARG(3), G(r->bits[0]) + ARG(1));
     c->eax = 0;
 }
+/* the game's own pair of per-frame VB/IB (object at 0x972a18: {.., vb} x 2 at +8 and +0x14, ib x 2 at +0x18): locked every
+   frame, the IB without the dynamic flag */
+static int is_ring(uint32_t obj) {
+    return obj == LD32(0x972a20) || obj == LD32(0x972a2c) || obj == LD32(0x972a30) || obj == LD32(0x972a34);
+}
+int d3d_buf_dynamic(uint32_t obj) { return (res(obj)->usage & 0x200) != 0 || is_ring(obj); }  /* shims.c */
 static void buf_GetDesc(Ctx* c) {  /* D3DVERTEXBUFFER_DESC {Format, Type, Usage, Pool, Size, FVF} */
     Res* r = res(ARG(0));
     uint32_t d[6] = {r->fmt, 3, r->usage, r->pool, r->size, 0};
@@ -241,7 +249,7 @@ static uint32_t shader_bytes(uint32_t code) {
     while (n < 0x10000 && LD32(code + 4 * n) != 0x0000ffffu) n++;
     return 4 * (n + 1);
 }
-static void dev_CreateVertexShader(Ctx* c) { dump_shader(ARG(1), "vs"); ST32(ARG(2), with_copy(vt_vs, ARG(1), shader_bytes(ARG(1)))); c->eax = 0; }
+static void dev_CreateVertexShader(Ctx* c) { g_layout_gen++; dump_shader(ARG(1), "vs"); ST32(ARG(2), with_copy(vt_vs, ARG(1), shader_bytes(ARG(1)))); c->eax = 0; }
 static void dev_CreatePixelShader(Ctx* c) { dump_shader(ARG(1), "ps"); ST32(ARG(2), with_copy(vt_ps, ARG(1), shader_bytes(ARG(1)))); c->eax = 0; }
 static void shader_GetFunction(Ctx* c) {  /* (data, size*): data NULL asks for the size */
     uint32_t o = ARG(0), n = LD32(o + 12);
@@ -259,6 +267,7 @@ static void dev_CreateVertexDeclaration(Ctx* c) {  /* D3DVERTEXELEMENT9 {stream,
     uint32_t e = ARG(1), n = 0;
     while (n < 64 && LD16(e + 8 * n) != 0xff) n++;
     uint32_t decl = with_copy(vt_decl, e, 8 * (n + 1));
+    g_layout_gen++;
     if (first_time(3, fnv(H(e), 8 * n))) {
         char b[512];
         int k = snprintf(b, sizeof b, "vertex declaration:");
@@ -405,6 +414,7 @@ static void cap_density(void) {
    recompute with 0x95c1ea). That setting corrects it for the real backbuffer: same horizontal field of view, a little
    less vertically (less to draw, too). The 2D layout keeps its 640x480 coordinates. */
 static uint32_t g_bbw, g_bbh;
+uint32_t g_tris;    /* triangles recorded (gl.c), the report */
 uint32_t g_culled;  /* draws gl.c left out, beyond the draw distance (the report) */
 uint32_t g_early;   /* render-list entries gl.c skipped before their draws (early cull) */
 static void fix_aspect(void) {
@@ -434,18 +444,61 @@ static void cap_build_dist(void) {
     if (LDF32(0x921f0c) != h) STF32(0x921f0c, h);
     if (LDF32(0x921f10) != l) STF32(0x921f10, l);
 }
+/* No fog in cutscenes: while the game's is_cut_scene_playing (670ca0: the singleton at 0x96feb8, bytes e1/e2) holds, its distance
+   clip 0x95c718, read every frame by 54e412 and 76c460, is off: the far plane goes to 10 km and the game's fog off, and gl.c's
+   fog and draw distance follow from that (g_world_fog). ux0:data/usm/cut_fog.txt containing 1 keeps the fog */
+volatile int g_cutscene;
+static void cut_no_fog(void) {
+    static int keep = -1, saved = -1;
+    if (keep < 0) {
+        keep = 0;
+        FILE* f = fopen(USM_DIR "cut_fog.txt", "r");
+        if (f) {
+            if (fscanf(f, "%d", &keep) != 1) keep = 0;
+            fclose(f);
+        }
+    }
+    int cut = !keep && (LD8(0x96feb8 + 0xe1) || LD8(0x96feb8 + 0xe2));
+    g_cutscene = cut;
+    if (cut && saved < 0) saved = LD8(0x95c718), ST8(0x95c718, 0), vlog("cutscene: no fog\n");
+    else if (!cut && saved >= 0) ST8(0x95c718, (uint8_t)saved), saved = -1, vlog("cutscene over\n");
+}
 /* once per world frame, on the main thread (native.c f_73ea70): Present may run on the pipeline's worker */
-void d3d_frame_fixups(void) { cap_density(), fix_aspect(), cap_build_dist(); }
+void d3d_frame_fixups(void) { cap_density(), fix_aspect(), cap_build_dist(), cut_no_fog(); }
 static void dev_Present(Ctx* c) {
     uint64_t t = sceKernelGetProcessTimeWide();
     if (!g_t0) g_t0 = g_last = t;
     extern int g_shim_verbose;
     if (g_frames == 3 && g_shim_verbose) g_shim_verbose = 0, vlog("call trace off after 3 frames\n");
+    void reg_flush(void);
+    reg_flush();
 #ifdef USM_DEBUG
+    if (getenv("VPC_TRACE_OPT")) g_shim_verbose = 0;  /* vpc: the Options stall, from Direct3DCreate9_ to the next frame */
     static int trace_at = -1;  /* vpc: VPC_TRACE_AT=<frame> logs every shim call of that one frame */
     if (trace_at < 0) trace_at = getenv("VPC_TRACE_AT") ? atoi(getenv("VPC_TRACE_AT")) : 0;
     if (trace_at && g_frames == (uint32_t)trace_at) g_shim_verbose = 1, vlog("call trace: frame %u\n", g_frames);
     if (trace_at && g_frames == (uint32_t)trace_at + 1) g_shim_verbose = 0;
+#endif
+#ifdef USM_DEBUG
+    /* VPC_INVERT_AT=<s>: at that time the camera invert setters run, as the Controls page does (GitHub issues 3, 6) */
+    if (getenv("VPC_INVERT_AT") && t - g_t0 > (uint64_t)atoi(getenv("VPC_INVERT_AT")) * 1000000) {
+        static int done;
+        if (!done) {
+            done = 1;
+            uint32_t a[2] = {0x88d648, 0x12};
+            if (getenv("VPC_REVERT")) {  /* 587900: Revert to Default on the Controls page; 587c50 saves it */
+                Ctx* x = rc_ctx();
+                uint32_t sp = x->esp;
+                x->ecx = LD32(0x96193c), guest_call(0x587900, 2, a), x->esp = sp;
+                x->ecx = LD32(0x96193c), guest_call(0x587c50, 2, a), x->esp = sp;
+                vlog("vpc: controls reverted to the defaults\n");
+            } else {
+                a[0] = getenv("VPC_INVERT_VAL") ? (uint32_t)atoi(getenv("VPC_INVERT_VAL")) : 1;
+                guest_call(0x582550, 1, a), guest_call(0x582590, 1, a);
+                vlog("vpc: invert setters called with %u\n", a[0]);
+            }
+        }
+    }
 #endif
     static uint32_t n;
     static uint64_t prev, worst;  /* the longest frame of the report's 2 s: the stutters the average hides */
@@ -465,6 +518,16 @@ static void dev_Present(Ctx* c) {
              (int)((mallinfo().uordblks - g_game_bytes - g_tex_bytes - g_vbuf_bytes - g_cmd_bytes) >> 20),
              g_client_draws / f, g_client_bytes / 1024.0 / f, gl_mem_free_mb(0), gl_mem_free_mb(1));
 #ifdef USM_VITAGL
+        extern uint64_t g_present_us;
+        extern uint64_t g_tex_live;
+        vlog("render thread: %.1f ms/frame busy, %.1f in the frame cap and swap; %.0f triangles/frame, textures %u MB in GL\n", (g_render_us - g_present_us) / 1000.0 / f, g_present_us / 1000.0 / f, g_tris / f, (uint32_t)(g_tex_live >> 20));
+        g_present_us = 0;
+        extern uint64_t g_dt[5];
+        vlog("draw time ms/frame: setup %.1f program %.1f uniforms %.1f textures %.1f rest %.1f\n", g_dt[0] / 1000.0 / f, g_dt[1] / 1000.0 / f, g_dt[2] / 1000.0 / f, g_dt[3] / 1000.0 / f, g_dt[4] / 1000.0 / f);
+        memset(g_dt, 0, sizeof g_dt);
+        extern uint64_t g_rt[4];
+        vlog("record time ms/frame: state %.1f cull %.1f commands %.1f textures %.1f\n", g_rt[0] / 1000.0 / f, g_rt[1] / 1000.0 / f, g_rt[2] / 1000.0 / f, g_rt[3] / 1000.0 / f);
+        memset(g_rt, 0, sizeof g_rt);
         extern uint32_t g_cmd_by[8];  /* gl.c: command bytes by type (C_PATCH 1, C_UPLOAD 3, C_BUFFER 4, C_DRAW 5) */
         vlog("commands per frame: state %.0f KB, draws %.0f KB, textures %.0f KB, buffers %.0f KB; game fog %08x (on %u, start %.0f end %.0f)\n",
              g_cmd_by[1] / 1024.0 / f, g_cmd_by[5] / 1024.0 / f, g_cmd_by[3] / 1024.0 / f, g_cmd_by[4] / 1024.0 / f, st.rs[34], st.rs[28],
@@ -473,7 +536,7 @@ static void dev_Present(Ctx* c) {
 #endif
         if (worst > 100000) vlog("worst frame %.0f ms: %u texture uploads, %u KB buffers, %u draws\n", worst / 1000.0, w_up, w_buf >> 10, w_dr);
         up0 = buf0 = dr0 = 0;
-        g_last = t, n = 0, worst = 0, g_culled = 0, g_early = 0, g_draws = g_uploads = g_buf_uploads = g_buf_bytes = g_client_draws = g_client_bytes = 0, g_draw_us = g_upload_us = g_swap_us = g_glcall_us = g_render_us = 0;
+        g_last = t, n = 0, worst = 0, g_tris = 0, g_culled = 0, g_early = 0, g_draws = g_uploads = g_buf_uploads = g_buf_bytes = g_client_draws = g_client_bytes = 0, g_draw_us = g_upload_us = g_swap_us = g_glcall_us = g_render_us = 0;
     }
     gl_present();
     c->eax = 0;
@@ -812,6 +875,9 @@ static void Direct3DCreate9_(Ctx* c) {
         vt_swap = com_vtable("IDirect3DSwapChain9", swap_impl);
     }
     vlog("Direct3DCreate9(%u)\n", ARG(0));
+#ifdef USM_DEBUG
+    if (getenv("VPC_TRACE_OPT")) { extern int g_shim_verbose; g_shim_verbose = 1; }
+#endif
     c->eax = com_new(vt_d3d, 16);
 }
 

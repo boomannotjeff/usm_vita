@@ -10,7 +10,7 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "Ultimate Spider-Man")
 set(VITA_TITLEID "USMR00001")
-set(VITA_VERSION "01.00")
+set(VITA_VERSION "01.10")
 
 set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 file(GLOB RECOMP_GEN CONFIGURE_DEPENDS ${SRC}/recomp/gen/recomp_*.c)
@@ -57,6 +57,8 @@ if(USM_VITAGL)
         SceGxm_stub SceDisplay_stub SceSysmodule_stub SceAppMgr_stub SceCommonDialog_stub SceIme_stub SceAppUtil_stub
         stdc++)
 endif()
+# gl.c: vitaGL's 2 MB uniform pool wraps within a frame and corrupts heavy scenes
+target_link_options(usm PRIVATE -Wl,--wrap=vglReserveUniformCircularPoolBuffer)
 target_link_libraries(usm pthread m SceLibKernel_stub SceKernelThreadMgr_stub SceProcessmgr_stub ScePower_stub SceCtrl_stub SceTouch_stub SceAudio_stub)
 
 vita_create_self(eboot.bin usm UNSAFE)

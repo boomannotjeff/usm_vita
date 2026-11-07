@@ -34,7 +34,10 @@ int log_on(void) {
 void vlog(const char* fmt, ...) {
     if (!log_on()) return;
     pthread_mutex_lock(&g_log_lock);
-    if (!g_log) g_log = fopen(USM_DIR "log.txt", "w");
+    if (!g_log) {  /* each launch overwrites log.txt: the one before stays as log_prev.txt */
+        remove(USM_DIR "log_prev.txt"), rename(USM_DIR "log.txt", USM_DIR "log_prev.txt");
+        g_log = fopen(USM_DIR "log.txt", "w");
+    }
     if (g_log) {
         va_list ap;
         va_start(ap, fmt);
@@ -64,19 +67,62 @@ void* game_mem(void* p) {
     if (p) __atomic_add_fetch(&g_game_bytes, (uint32_t)malloc_usable_size(p), __ATOMIC_RELAXED);
     return p;
 }
+/* While the pipeline's worker draws frame N, the logic tick can delete what frame N still points at (an NPC leaving: the
+   worker then read a texture pointer of 0x4b from the reused block, GitHub issue 5). Blocks freed in that window wait in
+   g_late until the worker is done (native.c pipe_fence). Everything the game frees comes through game_free */
+#ifndef RC_WTRACE
+extern volatile int g_wbusy;
+void pipe_fence(void);
+#define LATE_N 16384
+static void* g_late[LATE_N];
+static unsigned g_nlate;
+static pthread_mutex_t g_late_m = PTHREAD_MUTEX_INITIALIZER;
+void game_free_late(void) {  /* main, the worker idle */
+    pthread_mutex_lock(&g_late_m);
+    unsigned n = g_nlate;
+    g_nlate = 0;
+    for (unsigned i = 0; i < n; i++) {
+        __atomic_sub_fetch(&g_game_bytes, (uint32_t)malloc_usable_size(g_late[i]), __ATOMIC_RELAXED);
+        free(g_late[i]);
+    }
+    pthread_mutex_unlock(&g_late_m);
+}
+static int free_later(void* p) {
+    if (!g_wbusy) return 0;
+    pthread_mutex_lock(&g_late_m);
+    int kept = g_nlate < LATE_N;
+    if (kept) g_late[g_nlate++] = p;
+    pthread_mutex_unlock(&g_late_m);
+    if (!kept) pipe_fence();  /* a huge unload: the worker finishes, the queue empties, this one goes the normal way */
+    return kept;
+}
+#else
+static int free_later(void* p) { (void)p; return 0; }
+#endif
 void* game_realloc(void* p, uint32_t n) {
+#ifndef RC_WTRACE
+    if (p && n && g_wbusy) {  /* the old block may be in use: a new one, and the old one freed late */
+        void* q = game_mem(malloc(n));
+        if (!q) return NULL;
+        uint32_t old = (uint32_t)malloc_usable_size(p);
+        memcpy(q, p, old < n ? old : n);
+        game_free(p);
+        return q;
+    }
+#endif
     uint32_t old = p ? (uint32_t)malloc_usable_size(p) : 0;
     void* q = realloc(p, n);
     if (q || !n) __atomic_sub_fetch(&g_game_bytes, old, __ATOMIC_RELAXED);  /* failed: p is still held */
     return game_mem(q);
 }
 void game_free(void* p) {
-    if (p) __atomic_sub_fetch(&g_game_bytes, (uint32_t)malloc_usable_size(p), __ATOMIC_RELAXED), free(p);
+    { extern volatile uint32_t g_free_gen; g_free_gen++; }
+    if (p && !free_later(p)) __atomic_sub_fetch(&g_game_bytes, (uint32_t)malloc_usable_size(p), __ATOMIC_RELAXED), free(p);
 }
 
 void* guest_alloc(uint32_t n) {
     void* p = memalign(16, n);
-    if (!p) { vlog("out of memory (%u bytes)\n", n); abort(); }
+    if (!p) { vcrash("out of memory (%u bytes)\n", n); abort(); }
     memset(p, 0, n);
     GA(p);
     return p;
@@ -125,8 +171,30 @@ void rc_retbad(uint32_t fn, const char* reg, uint32_t local, uint32_t ctx) {
 }
 #endif
 
+/* a fatal error: always a line in ux0:data/usm/crash.txt, debug.txt or not, so a bug report has something to show */
+void vcrash(const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    vlog("%s", buf);
+    FILE* f = fopen(USM_DIR "crash.txt", "a");
+    if (f) fprintf(f, "%s", buf), fclose(f);
+}
+
 /* ---- traps ---- */
 void rc_trap(Ctx* c, uint32_t at, const char* why) {
+    vcrash("trap at %06x: %s\n", at, why);
+    {
+        char st[128];
+        int n = 0;
+        for (int i = 0; i < 32 && n < 100; i++) {
+            uint32_t v = LD32(c->esp + 4 * i);
+            if (v >= 0x401000 && v < 0x870000) n += snprintf(st + n, sizeof st - n, " %06x", v);
+        }
+        vcrash("  called from:%s\n", st);
+    }
     vlog("trap at %06x: %s\n  eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n  stack:", at, why,
          c->eax, c->ecx, c->edx, c->ebx, c->esp, c->ebp, c->esi, c->edi);
     for (int i = 0; i < 32; i++) {
@@ -161,7 +229,7 @@ static uint32_t cache_idx[8192];
 int gl_rl_before(uint32_t entry, uint32_t fn, uint32_t* mark);
 void gl_rl_after(uint32_t entry, uint32_t fn, const uint32_t* mark);
 
-static rc_fn lookup(uint32_t a) {
+__attribute__((hot)) static rc_fn lookup(uint32_t a) {
     if (a >= SHIM_BASE) return NULL;  /* imports and COM methods: never cached, so they skipped to the binary search */
     unsigned h = (a >> 4 ^ a >> 17) & 8191;
     uint32_t k = __atomic_load_n(&cache_idx[h], __ATOMIC_RELAXED);
@@ -177,14 +245,30 @@ void rc_native(Ctx* c, uint32_t target) {
     if (!shim_call(c, target)) rc_trap(c, target, "call to code that is neither translated nor a shim");
 }
 
-void rc_call(Ctx* c, uint32_t target, uint32_t ret) {
+__attribute__((hot)) void rc_call(Ctx* c, uint32_t target, uint32_t ret) {
     rc_fn f = lookup(target);
+#ifdef USM_DEBUG
+    { extern uint32_t g_rc_ret; g_rc_ret = ret; }
+#endif
     if (!f) { rc_native(c, target); return; }
 #ifdef USM_VITAGL
     /* the render lists' entry callbacks (77e190 / 77e220, ecx = the entry): gl.c's early cull */
     int rl = ret == 0x77e206u || ret == 0x77e296u;
     uint32_t mark[4], entry = c->ecx;
     if (rl && gl_rl_before(entry, target, mark)) return;
+#ifdef USM_DEBUG
+    if (target == 0x406350 && getenv("VPC_PROBE")) {
+        uint32_t m = LD32(entry + 0x14), t = m ? LD32(m + 0x20) : 0;
+        if (m && t < 0x10000) {
+            vlog("probe: entry %08x vt %08x m %08x (+14 of entry) tex %x, frame busy\n  entry:", entry, LD32(entry), m, t);
+            for (int i = 0; i < 12; i++) vlog(" %08x", LD32(entry + 4 * i));
+            vlog("\n  m-30:");
+            for (int i = -12; i < 24; i++) vlog(" %08x", LD32(m + 4 * i));
+            sceKernelDelayThread(5000);
+            vlog("\n  5 ms later tex %x m+24 %x entry+14 %x\n", LD32(m + 0x20), LD32(m + 0x24), LD32(entry + 0x14));
+        }
+    }
+#endif
 #endif
     c->esp -= 4;
     ST32(c->esp, ret);
@@ -217,6 +301,12 @@ typedef struct {
 } ProfEnt;
 #define PROF_N 16384
 static ProfEnt g_prof[PROF_N], g_wprof[PROF_N];  /* the game loop thread; the render pipeline's worker (native.c) */
+/* profile_hitch.txt: the game loop's samples from slow frames only, kept for the whole run. The current frame's stacks wait
+   here (innermost last) and count only if the frame ends up over HITCH_MS */
+#define HITCH_MS 70
+#define HITCH_DEPTH 24
+static ProfEnt g_hprof[PROF_N];
+static uint32_t g_hbuf[512][HITCH_DEPTH], g_hdepth[512], g_hn, g_hframes, g_hsamples;
 static Ctx* g_prof_ctx;
 static Ctx* volatile g_prof_wctx;
 void rc_prof_worker(Ctx* c) { g_prof_wctx = c; }
@@ -284,6 +374,34 @@ static void prof_dump(uint32_t samples, uint32_t outside) {
         fclose(f);
     }
 }
+static void hitch_keep(void) {
+    static uint32_t stamp;
+    g_hframes++;
+    for (uint32_t s = 0; s < g_hn; s++) {
+        stamp++, g_hsamples++;
+        for (uint32_t i = 0; i < g_hdepth[s]; i++) {
+            ProfEnt* e = prof_ent_in(g_hprof, g_hbuf[s][i]);
+            if (!e) continue;
+            if (e->stamp != stamp) e->stamp = stamp, e->incl++;
+            if (i == g_hdepth[s] - 1) e->self++;
+        }
+    }
+}
+static void hitch_dump(void) {
+    static ProfEnt s[PROF_N];
+    uint32_t n = 0;
+    if (!g_hsamples) return;
+    for (int i = 0; i < PROF_N; i++)
+        if (g_hprof[i].key) s[n++] = g_hprof[i];
+    qsort(s, n, sizeof *s, by_incl);
+    FILE* f = fopen(USM_DIR "profile_hitch.txt", "w");
+    if (f) {
+        fprintf(f, "# %u frames over %d ms, %u samples: incl%% self%% address\n", g_hframes, HITCH_MS, g_hsamples);
+        for (uint32_t i = 0; i < n; i++)
+            fprintf(f, "%6.2f %6.2f %06x\n", 100.0 * s[i].incl / g_hsamples, 100.0 * s[i].self / g_hsamples, prof_addr(s[i].key));
+        fclose(f);
+    }
+}
 static int prof_main(SceSize args, void* argp) {
     (void)args, (void)argp;
     uint32_t samples = 0, outside = 0, wbusy = 0;
@@ -318,8 +436,16 @@ static int prof_main(SceSize args, void* argp) {
             extern uint32_t d3d_frame_count(void);
             static uint32_t last_frame, still;
             uint32_t fr = d3d_frame_count();
-            if (fr != last_frame) last_frame = fr, still = 0;
-            else if (++still % 250 == 0 && still <= 1000 && fr > 100) {
+            if (fr != last_frame) {
+                if (still >= HITCH_MS && fr > 100) hitch_keep();
+                g_hn = 0, last_frame = fr, still = 0;
+            }
+            if (g_hn < 512) {
+                uint32_t k = 0, from = d > HITCH_DEPTH ? d - HITCH_DEPTH : 0;
+                for (uint32_t i = from; i < d; i++) g_hbuf[g_hn][k++] = c->pstack[i] ? c->pstack[i] : 0xffffffffu;
+                g_hdepth[g_hn++] = k;
+            }
+            if (++still % 250 == 0 && still <= 1000 && fr > 100) {
                 char line[400];
                 int o = snprintf(line, sizeof line, "hitch %u ms at frame %u, innermost first:", still, fr);
                 for (int i = (int)d - 1; i >= 0 && i >= (int)d - 14 && o < (int)sizeof line - 8; i--)
@@ -335,7 +461,7 @@ static int prof_main(SceSize args, void* argp) {
             shim_dump(frames - frames0), frames0 = frames;
         }
         if (samples == 10000)
-            prof_dump(samples, outside), prof_dump_worker(samples, wbusy), memset(g_prof, 0, sizeof g_prof),
+            prof_dump(samples, outside), prof_dump_worker(samples, wbusy), hitch_dump(), memset(g_prof, 0, sizeof g_prof),
                 memset(g_wprof, 0, sizeof g_wprof), memset(g_edge, 0, sizeof g_edge), samples = outside = wbusy = 0;
     }
     return 0;

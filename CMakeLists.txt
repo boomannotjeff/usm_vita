@@ -42,7 +42,7 @@ target_link_libraries(usm_re PRIVATE winmm)  # timeBeginPeriod for the profiler
 # Standalone PC build: USM.exe's code is never executed, only its recompiled translation (src/pc/main.c).
 # Lives in the game folder next to USM.exe. The image base keeps 0x400000 free for the mapped game, the big
 # stack is shared with the translated code's host stack (rt.c), and nxcompat turns on DEP for the coverage gate.
-add_executable(usm_pc src/pc/main.c src/pc/census.c $<TARGET_OBJECTS:recomp>)
+add_executable(usm_pc src/pc/main.c src/pc/census.c src/pc/tweaks.c $<TARGET_OBJECTS:recomp>)
 target_include_directories(usm_pc PRIVATE src/recomp src/recomp/gen)
 target_compile_options(usm_pc PRIVATE -std=gnu11 -w)
 target_link_options(usm_pc PRIVATE -static -Wl,--image-base,0x10000000 -Wl,--stack,0x800000 -Wl,--nxcompat)

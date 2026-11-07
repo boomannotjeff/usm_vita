@@ -1,6 +1,6 @@
 """Reads a Vita crash dump (psp2core-*.psp2dmp, gzipped ELF core) of usm.vpk: each thread's registers and the
 translated functions (f_XXXXXX = guest address) and C functions found on the crashed thread's stack, newest first.
-usage: py tools/recomp/vita_core.py <dump> [build-vita/usm]"""
+usage: py tools/recomp/vita_core.py <dump> [build-vita/usm] [thread uid, hex: its stack instead of the first thread's]"""
 import gzip
 import os
 import struct
@@ -65,7 +65,7 @@ for t in range(n):
     r = struct.unpack_from('<17I', regs, k + 8)
     print('thread %08x: pc=%08x (%s) lr=%08x (%s) sp=%08x' % (uid, r[15], sym(r[15]), r[14], sym(r[14]), r[13]))
     print('  ' + ' '.join('r%d=%08x' % (i, r[i]) for i in range(13)))
-    if t == 0:
+    if (t == 0 and len(sys.argv) < 4) or (len(sys.argv) > 3 and uid == int(sys.argv[3], 16)):
         crash_sp = r[13]
     k += size
 print('stack of the first thread (return addresses, newest first):')

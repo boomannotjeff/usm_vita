@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <strings.h>
 
+#include <psp2/kernel/processmgr.h>
 #include "vita.h"
 
 #define MAX_SLOTS 8192
@@ -21,7 +22,7 @@ typedef struct {
 #endif
 } Slot;
 /* kind, from the name once (the pipeline checks it on every call): */
-enum { K_D3D = 1, K_DRAW = 2, K_SETSTREAM = 4 };
+enum { K_D3D = 1, K_DRAW = 2, K_SETSTREAM = 4, K_PURE = 8, K_BUFLOCK = 16, K_RELEASE = 32 };
 
 /* C runtime helpers called thousands of times (ctype, strings, memory, math): left out of the call trace */
 static int quiet_name(const char* dll, const char* n) {
@@ -58,6 +59,11 @@ uint32_t shim_new(const char* name, shim_fn fn, int pops) {
     if (!strncmp(name, "IDirect3D", 9)) g_slot[k].kind = K_D3D;
     if (!strncmp(name, "IDirect3DDevice9::Draw", 22)) g_slot[k].kind |= K_DRAW;
     if (!strcmp(name, "IDirect3DDevice9::SetStreamSource")) g_slot[k].kind |= K_SETSTREAM;
+    /* no fence: they only read a resource's description (a buffer's Unlock does nothing, a surface's Release only counts), or lock the half of the game's
+       dynamic VB/IB pair the worker is not drawing from */
+    if (g_slot[k].kind && (strstr(name, "::GetDesc") || strstr(name, "::GetLevelCount") || strstr(name, "Buffer9::Unlock") || strstr(name, "Surface9::Release"))) g_slot[k].kind |= K_PURE;
+    if (g_slot[k].kind && strstr(name, "Buffer9::Lock")) g_slot[k].kind |= K_BUFLOCK;
+    if (g_slot[k].kind && (strstr(name, "Buffer9::Release") || strstr(name, "Texture9::Release"))) g_slot[k].kind |= K_RELEASE;
     pthread_mutex_unlock(&g_lock);
     return SHIM_BASE + 4 * k;
 }
@@ -79,7 +85,9 @@ uint32_t shim_addr(const char* dll, const char* name, int pops) {
 /* the last 64 shims called (slot numbers, newest at g_trace_n - 1): in .bss, so a crash dump shows them */
 volatile uint16_t g_trace[64];
 volatile uint32_t g_trace_n;
+uint32_t g_rc_ret;  /* the last rc_call's return address, for the trace below (debug builds) */
 int g_shim_verbose;  /* every shim call to the log: on when ux0:data/usm/trace.txt exists (main.c) */
+int g_shim_trace;  /* keep the last shims for crash notes: only with debug.txt (main.c) */
 
 #ifdef RC_PROFILE
 static Slot* volatile g_cur;  /* the shim running (racy with the pipeline's worker: counts only) */
@@ -105,25 +113,39 @@ void shim_dump(uint32_t frames) {
 }
 #endif
 
-int shim_call(Ctx* c, uint32_t target) {
+__attribute__((hot)) int shim_call(Ctx* c, uint32_t target) {
     if (target < SHIM_BASE || target >= SHIM_BASE + 4 * g_nslots || target & 3) return 0;
     Slot* s = &g_slot[(target - SHIM_BASE) / 4];
-    g_trace[g_trace_n++ & 63] = (uint16_t)((target - SHIM_BASE) / 4);
+    /* debug only: both cores wrote this line on every shim call, bouncing it between their caches */
+    if (g_shim_trace) g_trace[g_trace_n++ & 63] = (uint16_t)((target - SHIM_BASE) / 4);
 #ifdef RC_WTRACE
     if (rc_wt_on) rc_wt_shim(s->name);
 #endif
     if (g_shim_verbose && !s->quiet)
-        vlog("%x> %s(%08x, %08x, %08x, %08x)\n", sceKernelGetThreadId() & 0xfff, s->name, ARG(0), ARG(1), ARG(2), ARG(3));
+        vlog("%x> %u %x %s(%08x, %08x, %08x, %08x, %08x, %08x)\n", sceKernelGetThreadId() & 0xfff, (uint32_t)sceKernelGetProcessTimeWide(), g_rc_ret, s->name, ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5));
 #ifndef RC_WTRACE
     /* render pipeline (native.c): D3D is single-threaded, so a D3D call waits while the worker draws */
     extern volatile int g_wbusy;
+    extern Ctx* g_wc;
     void pipe_fence_d3d(Ctx* c, const char* name);
-    if (g_wbusy && s->kind) {
+    if (g_wbusy && s->kind && c != g_wc) {  /* the worker itself: ~11,000 D3D calls a frame that wait for nothing */
+        int pipe_defer_release(Ctx* c, uint32_t o);
+        if (s->kind & K_RELEASE && pipe_defer_release(c, ARG(0))) {
+            c->eax = 1;  /* the count it had: the game never reads it back here */
+            c->esp += s->pops;
+            return 1;
+        }
         /* except the world frame tail's unbind of stream 0, which the worker does itself (d3d9_null.c skips main's) */
-        if (!(s->kind & K_SETSTREAM && ARG(1) == 0 && ARG(2) == 0)) pipe_fence_d3d(c, s->name);
-        void pipe_draw_delay(Ctx* c);
-        if (s->kind & K_DRAW) pipe_draw_delay(c);
+        int d3d_buf_dynamic(uint32_t obj);
+        int pipe_ring_copy(Ctx* c);
+        if (!(s->kind & K_PURE) && !(s->kind & K_BUFLOCK && (d3d_buf_dynamic(ARG(0)) || pipe_ring_copy(c))) &&
+            !(s->kind & K_SETSTREAM && ARG(1) == 0 && ARG(2) == 0))
+            pipe_fence_d3d(c, s->name);
     }
+#ifdef USM_DEBUG
+    void pipe_draw_delay(Ctx* c);
+    if (s->kind & K_DRAW) pipe_draw_delay(c);
+#endif
 #endif
 #ifdef RC_PROFILE
     s->calls++, g_cur = s;

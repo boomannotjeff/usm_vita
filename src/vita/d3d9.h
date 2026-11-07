@@ -18,6 +18,8 @@ typedef struct {
     uint32_t dropped;                               /* the level copies were freed once on the GPU */
     uint32_t sent;                                  /* gl.c, game thread: level 0 / the buffer is in a command */
     uint32_t gen;                                   /* a buffer's content version: new on every write Lock */
+    uint32_t gl_bytes;                              /* gl.c: texture bytes held by GL, the report */
+    uint32_t tp[4];                                 /* gl.c, render thread: the sampler parameters last set on this texture */
     uint32_t base;                                  /* gl.c: the level uploaded as GL level 0 (texture size cap) */
 } Res;
 static inline Res* res(uint32_t obj) { return H(LD32(obj + 8)); }

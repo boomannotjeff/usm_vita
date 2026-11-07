@@ -53,7 +53,7 @@ static void reg_load(void) {
 /* the Vita's defaults for the detail options, as the in-game Options menu writes them; less to draw = less game work */
 static void reg_defaults(void) {
     static const struct { const char* name; uint32_t type, size; const char* data; } D[] = {
-        {"Resolution", 1, 8, "720x408"},  /* 3/4 of the screen each way, scaled up: the 3D scene is the GPU's cost */
+        {"Resolution", 1, 8, "960x544"},  /* the screen's own size */
         {"DetailedShadows", 4, 4, "\0\0\0\0"},
         {"DistanceClipping", 4, 4, "\1\0\0\0"},
         {"Distance", 4, 4, "\1\0\0\0"},
@@ -63,10 +63,26 @@ static void reg_defaults(void) {
         char p[200];
         snprintf(p, sizeof p, "HKCU\\Software\\Activision\\Ultimate Spider-Man\\Settings\\%s", D[i].name);
         RegVal* v = reg_find(p);
-        if (v && !(i == 0 && v->size >= 7 && !memcmp(v->data, "960x544", 7))) continue;  /* the old default goes */
+        if (v) continue;
         if (!v) v = &g_reg[g_nreg++];
         strcpy(v->path, p), v->type = D[i].type, v->size = D[i].size;
         memcpy(v->data, D[i].data, D[i].size);
+    }
+    /* ux0:data/usm/language.txt (the Settings menu): 0 English .. 4 Italian, the game's own Settings\Language, read at
+       start: its text comes from Data/usm_lt<letter>.usm, which only that language's PC install has. Missing: English */
+    FILE* lf = fopen(USM_DIR "language.txt", "r");
+    if (lf) {
+        int n = 0;
+        if (fscanf(lf, "%d", &n) != 1 || n < 0 || n > 4) n = 0;
+        fclose(lf);
+        char file[96];
+        snprintf(file, sizeof file, USM_DIR "Data/usm_lt%c.usm", "efgsi"[n]);
+        if (!(lf = fopen(file, "r"))) vlog("language: %s is missing, using English\n", file), n = 0;
+        else fclose(lf);
+        static const char* path = "HKCU\\Software\\Activision\\Ultimate Spider-Man\\Settings\\Language";
+        RegVal* v = reg_find(path);
+        if (!v && g_nreg < 256) v = &g_reg[g_nreg++], strcpy(v->path, path);
+        if (v) v->type = 4, v->size = 4, memset(v->data, 0, 4), v->data[0] = (uint8_t)n;
     }
     /* ux0:data/usm/resolution.txt ("640x362"): the 3D resolution, over whatever the Options menu saved (read at start) */
     FILE* rf = fopen(USM_DIR "resolution.txt", "r");
@@ -85,6 +101,19 @@ static void reg_defaults(void) {
         } else vlog("resolution.txt: want e.g. 640x362 (160x90 to 960x544)\n");
         fclose(rf);
     }
+    /* the game's own far clip: Settings\Distance D ends its fog at 100 + 19 D (D 1: 119 m), anything past that is not drawn. A
+       longer distance.txt gets a D reaching past it, so our fog hides the edge; 0 (no fog) turns the clip off */
+    FILE* df = fopen(USM_DIR "distance.txt", "r");
+    float view = 120;
+    if (df) {
+        if (fscanf(df, "%f", &view) != 1) view = 120;
+        fclose(df);
+    }
+    if (getenv("VPC_FAR")) view = (float)atof(getenv("VPC_FAR"));  /* vpc tests */
+    RegVal* clip = reg_find("HKCU\\Software\\Activision\\Ultimate Spider-Man\\Settings\\DistanceClipping");
+    RegVal* dist = reg_find("HKCU\\Software\\Activision\\Ultimate Spider-Man\\Settings\\Distance");
+    if (clip) clip->data[0] = view > 0;
+    if (dist) dist->data[0] = view > 120 ? (uint8_t)((view * 1.25f - 100) / 19 + 1) : 1;
     /* pad bindings (the 3rd slot of each action, code | 3 << 16) for the actions USM.exe leaves without one, so the
        Vita drives them as a gamepad (input.c buttons: 5 L, 6 R = codes 0x19, 0x1a; right
        stick on Z = codes 5/6, Rz = 11/12). Set when missing or unbound (ffff), never over a binding the player chose. */
@@ -93,6 +122,9 @@ static void reg_defaults(void) {
         {"CameraLeft3", 0x06}, {"CameraRight3", 0x05}, {"CameraCenter3", 0x1d},  /* 0x1d: rear touch (input.c) */
     };  /* Pause and BackButton stay on Esc/M (input.c), which menus may also read directly */
     for (unsigned i = 0; i < sizeof P / sizeof *P; i++) {
+#ifdef USM_DEBUG
+        if (getenv("VPC_NO_PAD_DEFAULTS")) break;  /* the game table (main.c) must be enough */
+#endif
         char p[200];
         snprintf(p, sizeof p, "HKCU\\Software\\Activision\\Ultimate Spider-Man\\Controls\\Player1\\%s", P[i].name);
         RegVal* v = reg_find(p);
@@ -106,9 +138,11 @@ static void reg_defaults(void) {
         v->data[0] = P[i].code, v->data[1] = 0, v->data[2] = 3, v->data[3] = 0;
     }
 }
+static int g_reg_dirty;
 static void reg_save(void) {
     FILE* f = fopen(REG_FILE, "w");
     if (!f) return;
+    g_reg_dirty = 0;
     for (int i = 0; i < g_nreg; i++) {
         fprintf(f, "%s\t%u\t", g_reg[i].path, g_reg[i].type);
         for (uint32_t k = 0; k < g_reg[i].size; k++) fprintf(f, "%02x", g_reg[i].data[k]);
@@ -176,6 +210,13 @@ static void RegQueryValueExA_(Ctx* c) {  /* (key, name, res, type*, data*, size*
     pthread_mutex_unlock(&g_reg_m);
     c->eax = r;
 }
+/* the game sets values in bursts (66 leaving Options): one file write per frame, on Present, and on quit (f_4c2a80) */
+void reg_flush(void) {
+    if (!g_reg_dirty) return;
+    pthread_mutex_lock(&g_reg_m);
+    reg_save();
+    pthread_mutex_unlock(&g_reg_m);
+}
 static void RegSetValueExA_(Ctx* c) {  /* (key, name, res, type, data, size) */
     char p[200];
     pthread_mutex_lock(&g_reg_m);
@@ -187,7 +228,13 @@ static void RegSetValueExA_(Ctx* c) {  /* (key, name, res, type, data, size) */
         if (v) {
             v->type = ARG(3), v->size = ARG(5) < sizeof v->data ? ARG(5) : sizeof v->data;
             memcpy(v->data, H(ARG(4)), v->size);
-            reg_save();
+            g_reg_dirty = 1;
+            /* the in-game Options choose a resolution too: resolution.txt, which wins at start, follows it */
+            unsigned rw, rh;
+            if (strstr(p, "Settings\\Resolution") && sscanf((const char*)v->data, "%ux%u", &rw, &rh) == 2 && rw >= 160 && rw <= 960 && rh >= 90 && rh <= 544) {
+                FILE* rf = fopen(USM_DIR "resolution.txt", "w");
+                if (rf) fprintf(rf, "%ux%u", rw, rh), fclose(rf);
+            }
             vlog("registry: %s = type %u, %u bytes\n", p, v->type, v->size);
             r = 0;
         }

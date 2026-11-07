@@ -2,6 +2,7 @@
    through G(). The heap is newlib's malloc: its blocks are valid guest addresses (see vita.h). */
 #include <ctype.h>
 #include <malloc.h>
+#include <psp2/kernel/processmgr.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,9 @@ static void __getmainargs(Ctx* c) {
 static void exit_(Ctx* c) {
     vlog("exit(%d)\n", (int)ARG(0));
     crt_run_onexit();
-    exit((int)ARG(0));
+    /* not libc's exit(): its teardown runs with the game's and our threads still alive, some blocked on what it needs
+       (Quit -> Yes hung here on the Vita, GitHub issue 6) */
+    sceKernelExitProcess((int)ARG(0));
 }
 
 /* ---- strings ---- */

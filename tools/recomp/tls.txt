@@ -4,3 +4,13 @@
 971f0c 4 scratch   the per-frame scratch arena pointer: the worker allocates EXEC's sort arrays in its own arena
 95c724 10 in,stack  the scratch stack 4db590 (entity matrices) walks nodes on: size, alignment, base, top; the worker gets its own block
 970d60 4 -   that stack's "in use" flag
+921d7c 4 in   render list build -> EXEC: a view scale the next build rewrites (54e1b0)
+971f00 8 in   the view being walked and the view list root: EXEC changes the first, the next build both
+972904 c in   draw stamp, Present count and its copy: pipe_after_handoff advances the real ones
+972a3c 34 in  the dynamic VB/IB pair (object at 0x972a18): write cursors, ring index, the pair in use; EXEC keeps frame N's
+973730 4 in   current state object, set now and then by the logic
+973b70 8 in   the current render list heads, in the scratch arena
+975310 8 in   the second per-frame allocator's cursor and base: pipe_after_handoff flips the real ones
+975890 8 in   frame start time, EXEC turns it into a duration
+9758d0 8 in   frame statistics
+9758f8 4 in   this frame's options, copied by 76e050

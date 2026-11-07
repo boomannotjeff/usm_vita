@@ -45,6 +45,7 @@ uint32_t crt_data_import(const char* name);  /* shims_crt.c: guest address of a 
 void* crt_file(uint32_t f);                   /* a guest FILE* as a host FILE* (_iob's streams included) */
 void apc_run(Ctx* c);                         /* shims_kernel32.c: run this thread's queued I/O completions */
 void vlog(const char* fmt, ...);
+void vcrash(const char* fmt, ...);  /* rt_vita.c: vlog + ux0:data/usm/crash.txt, always */
 int log_on(void);  /* debug.txt there: log.txt and the speed report */
 void* guest_alloc(uint32_t n);  /* zeroed, 16-aligned, never freed: TEB, stacks, COM objects */
 /* the game's own allocations (malloc, new, HeapAlloc, VirtualAlloc shims) pass through these, so the speed report
