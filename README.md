@@ -84,7 +84,7 @@ The first time each area runs, it can pause briefly while shaders compile. They 
 The game picks its text from `Data/usm_lte.usm` (English), `usm_ltf.usm` (French), `usm_ltg.usm` (German),
 `usm_lts.usm` (Spanish) or `usm_lti.usm` (Italian). A PC install only has its own language, and none of this is shipped
 here, so to play in another language use the `Data` folder of that language's PC release, then pick it in Settings. If
-the file is missing the game stays in English.
+the file is missing the game stays in English. You also need the sound files for each language.
 
 ## Which game files work
 Use the `Data` folder of a full PC install (about 1.6 GB, with `Data/movies`, `Data/Sound`, `Data/packs`). Cut-down
